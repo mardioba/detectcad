@@ -26,10 +26,10 @@ logs/*.log.*
 # NÃO versione pesos de modelo nem fotos do cliente.
 data/models/*.pt
 *.pt
-training/runs/
-training/datasets/images/
-training/datasets/labels/
-training/datasets/raw/
+training/runs/*
+training/datasets/raw/*
+training/datasets/images/**
+training/datasets/labels/**
 
 # Material bruto da operação: fotos e vídeos do galpão.
 # Motivos: (1) são dados confidenciais do cliente, (2) prints de player
@@ -47,14 +47,12 @@ fotos/
 !data/results/.gitkeep
 !data/config/.gitkeep
 !logs/.gitkeep
-!training/datasets/images/train/.gitkeep
-!training/datasets/images/val/.gitkeep
-!training/datasets/images/test/.gitkeep
-!training/datasets/labels/train/.gitkeep
-!training/datasets/labels/val/.gitkeep
-!training/datasets/labels/test/.gitkeep
-!training/datasets/raw/.gitkeep
 !training/runs/.gitkeep
+!training/datasets/raw/.gitkeep
+!training/datasets/images/*/
+!training/datasets/images/*/.gitkeep
+!training/datasets/labels/*/
+!training/datasets/labels/*/.gitkeep
 
 # Sistema
 .DS_Store
