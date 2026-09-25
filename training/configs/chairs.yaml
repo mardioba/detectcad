@@ -1,0 +1,11 @@
+# Gerado automaticamente por app/services/dataset_service.py
+# Ajuste à mão se preferir manter o controle manual - o próximo
+# "Gerenciar dataset > Dividir" reescreve este arquivo.
+path: /home/mardio/PROJETOS2026/detectcad/training/datasets
+train: images/train
+val: images/val
+test: images/test
+
+names:
+  0: chair
+  1: pile

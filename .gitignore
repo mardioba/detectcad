@@ -1,0 +1,63 @@
+# ============================================================================
+# CONTADOR DE CADEIRAS — arquivos que não vão para o git
+# ============================================================================
+
+# Ambiente e segredos
+.venv/
+.env
+*.pyc
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Dados de execução (regeneráveis)
+data/chairs.db
+data/chairs.db-wal
+data/chairs.db-shm
+data/config/*.json
+data/results/
+data/snapshots/
+logs/*.log
+logs/*.log.*
+
+# Dataset e modelos: grandes e específicos da empresa.
+# NÃO versione pesos de modelo nem fotos do cliente.
+data/models/*.pt
+*.pt
+training/runs/
+training/datasets/images/
+training/datasets/labels/
+training/datasets/raw/
+
+# Material bruto da operação: fotos e vídeos do galpão.
+# Motivos: (1) são dados confidenciais do cliente, (2) prints de player
+# carregam a URL RTSP com usuário e senha na barra de título,
+# (3) vídeo não versionado deixa o repositório leve.
+fotos/
+*.mp4
+*.avi
+*.mkv
+*.mov
+
+# Mantém a estrutura de pastas no repositório
+!data/models/.gitkeep
+!data/snapshots/.gitkeep
+!data/results/.gitkeep
+!data/config/.gitkeep
+!logs/.gitkeep
+!training/datasets/images/train/.gitkeep
+!training/datasets/images/val/.gitkeep
+!training/datasets/images/test/.gitkeep
+!training/datasets/labels/train/.gitkeep
+!training/datasets/labels/val/.gitkeep
+!training/datasets/labels/test/.gitkeep
+!training/datasets/raw/.gitkeep
+!training/runs/.gitkeep
+
+# Sistema
+.DS_Store
+Thumbs.db
+*.swp
+*~

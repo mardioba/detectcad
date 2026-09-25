@@ -1,0 +1,18 @@
+# ============================================================================
+# CONTADOR DE CADEIRAS - Dependências de TREINAMENTO
+# ----------------------------------------------------------------------------
+# Instalação:  pip install -r requirements.txt -r requirements-train.txt
+# ============================================================================
+
+# pycocotools é usado pelo Ultralytics para descrever e validar o dataset
+# em tempo de treino (converte o dataset YOLO e valida as caixas).
+pycocotools==2.0.8
+
+# Ferramentas de apoio ao dataset
+PyYAML==6.0.2
+tqdm==4.67.1
+
+# Opcional: exporta o modelo treinado para ONNX/TensorRT.
+# onnx==1.17.0
+# onnxruntime==1.19.2
+# onnxslim==0.1.13

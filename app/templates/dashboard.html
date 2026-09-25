@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Contador de Cadeiras</title>
+<link rel="stylesheet" href="/static/css/dashboard.css">
+</head>
+<body>
+
+<!-- ================= MENU LATERAL ================= -->
+<aside id="sidebar">
+  <div class="brand">
+    <div class="brand-icon">&#129693;</div>
+    <div class="brand-text">
+      <strong>CONTADOR</strong>
+      <small>cadeiras plásticas</small>
+    </div>
+  </div>
+
+  <nav class="menu">
+    <a href="#dashboard" class="active" data-page="dashboard"><span class="ico">&#9632;</span>Dashboard</a>
+    <a href="#camera"    data-page="camera"><span class="ico">&#9673;</span>Câmera</a>
+    <a href="#counting"  data-page="counting"><span class="ico">&#8721;</span>Contagem</a>
+    <a href="#history"   data-page="history"><span class="ico">&#128200;</span>Histórico</a>
+    <a href="#calibration" data-page="calibration"><span class="ico">&#9881;</span>Calibração</a>
+    <a href="#dataset"   data-page="dataset"><span class="ico">&#128193;</span>Dataset</a>
+    <a href="#annotation" data-page="annotation"><span class="ico">&#9998;</span>Anotação</a>
+    <a href="#training"  data-page="training"><span class="ico">&#9881;</span>Treinamento</a>
+    <a href="#model"     data-page="model"><span class="ico">&#9731;</span>Modelo</a>
+    <a href="#settings"  data-page="settings"><span class="ico">&#9881;</span>Configurações</a>
+    <a href="#logs"      data-page="logs"><span class="ico">&#128220;</span>Logs</a>
+  </nav>
+
+  <div class="sidebar-foot">
+    <div id="ws-indicator" class="ws-off">
+      <span class="dot"></span> <span id="ws-text">conectando…</span>
+    </div>
+  </div>
+</aside>
+
+<!-- ================= CONTEÚDO ================= -->
+<main id="content">
+
+  <header class="topbar">
+    <h1 id="page-title">Dashboard</h1>
+    <div class="topbar-right">
+      <span id="clock" class="clock"></span>
+      <span id="mode-badge" class="badge badge-warn">iniciando</span>
+    </div>
+  </header>
+
+  <div id="alerts-bar"></div>
+
+  <!-- ---------------------------------------------- DASHBOARD -->
+  <section class="page" id="page-dashboard">
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-head">
+          <h2>Câmera</h2>
+          <div class="card-actions">
+            <span id="cam-state-pill" class="pill pill-offline">OFFLINE</span>
+            <a class="btn btn-ghost" href="/api/frame.jpg" target="_blank" download>Baixar frame</a>
+          </div>
+        </div>
+        <div class="video-wrap">
+          <img id="video" src="/api/stream.mjpg" alt="Vídeo da câmera com contagem">
+          <div id="video-empty" class="video-empty">aguardando frame da câmera…</div>
+        </div>
+        <div class="video-meta">
+          <span id="meta-res">—</span><span id="meta-fps">—</span><span id="meta-url">—</span>
+        </div>
+      </div>
+
+      <div class="stack">
+        <div class="card total-card">
+          <div class="total-label">TOTAL DE CADEIRAS</div>
+          <div id="total-value" class="total-value">—</div>
+          <div class="total-sub">
+            <span id="total-tentative">—</span>
+            <span id="total-piles">—</span>
+          </div>
+        </div>
+
+        <div class="stats-row">
+          <div class="stat"><div class="stat-value" id="stat-piles">0</div><div class="stat-label">PILHAS</div></div>
+          <div class="stat"><div class="stat-value" id="stat-camera">—</div><div class="stat-label">CÂMERA</div></div>
+          <div class="stat"><div class="stat-value" id="stat-conf">—</div><div class="stat-label">IA</div></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>Pilhas detectadas</h2>
+            <span class="hint">clique em uma pilha para corrigir</span>
+          </div>
+          <div id="piles-list" class="piles-list">
+            <div class="empty">Nenhuma pilha detectada.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>Histórico</h2>
+        <select id="chart-range" class="sel">
+          <option value="60">Último minuto</option>
+          <option value="600">Últimos 10 min</option>
+          <option value="3600">Última hora</option>
+        </select>
+      </div>
+      <canvas id="chart-main" height="110"></canvas>
+    </div>
+  </section>
+
+  <!-- ---------------------------------------------- CÂMERA -->
+  <section class="page hidden" id="page-camera">
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-head"><h2>Vídeo ao vivo</h2>
+          <div class="card-actions">
+            <button class="btn btn-ghost" id="toggle-overlay">Ver imagem original</button>
+          </div>
+        </div>
+        <div class="video-wrap">
+          <img id="video2" src="/api/stream.mjpg" alt="Vídeo">
+          <div id="video2-empty" class="video-empty">aguardando frame…</div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>Detalhes da conexão</h2></div>
+        <table class="table" id="camera-table"><tbody></tbody></table>
+        <div class="note" id="camera-note"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ---------------------------------------------- CONTAGEM -->
+  <section class="page hidden" id="page-counting">
+    <div class="card">
+      <div class="card-head">
+        <h2>Contagem por pilha</h2>
+        <div class="card-actions">
+          <button class="btn" id="btn-snapshot">Salvar snapshot</button>
+          <label class="switch"><input type="checkbox" id="auto-sync" checked> sincronizar</label>
+        </div>
+      </div>
+      <table class="table" id="count-table">
+        <thead><tr>
+          <th>Pilha</th><th>Quantidade</th><th>Confiança</th><th>Estado</th>
+          <th>Método</th><th>Detecção</th><th>Estabilidade</th><th>Passo</th><th>Ajuste</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-head"><h2>Total ao longo do tempo</h2></div>
+        <canvas id="chart-count" height="120"></canvas>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>Correções manuais</h2>
+          <span class="hint">IA vs. operador — vira dado de análise</span>
+        </div>
+        <div id="correction-stats" class="correction-stats"></div>
+        <table class="table small" id="correction-table">
+          <thead><tr><th>Data</th><th>IA</th><th>Correção</th><th>Erro</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ---------------------------------------------- HISTÓRICO -->
+  <section class="page hidden" id="page-history">
+    <div class="card">
+      <div class="card-head">
+        <h2>Histórico de contagens</h2>
+        <div class="card-actions">
+          <select id="hist-range" class="sel">
+            <option value="24">Hoje (24h)</option>
+            <option value="168">7 dias</option>
+            <option value="720">30 dias</option>
+            <option value="custom">Personalizado</option>
+          </select>
+          <input type="date" id="hist-from" class="sel hidden">
+          <input type="date" id="hist-to" class="sel hidden">
+          <button class="btn btn-ghost" id="hist-export">Exportar CSV</button>
+        </div>
+      </div>
+      <canvas id="chart-history" height="150"></canvas>
+    </div>
+    <div class="card">
+      <div class="card-head"><h2>Registros</h2><span id="hist-count" class="hint"></span></div>
+      <div class="table-scroll">
+        <table class="table small" id="history-table">
+          <thead><tr>
+            <th>Data/Hora</th><th>Pilha</th><th>Quantidade</th><th>Confiança</th>
+            <th>Estado</th><th>Método</th><th>Anterior</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ---------------------------------------------- CALIBRAÇÃO -->
+  <section class="page hidden" id="page-calibration">
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-head"><h2>Desenhar ROI</h2>
+          <span class="hint">arraste sobre a imagem</span>
+        </div>
+        <p class="muted">Como a câmera é fixa, tudo fora da ROI é ignorado. Deixe
+           apenas a área onde as cadeiras podem aparecer.</p>
+        <div class="roi-canvas-wrap" id="roi-wrap">
+          <canvas id="roi-canvas"></canvas>
+        </div>
+        <div class="row">
+          <button class="btn btn-ghost" id="roi-clear">Limpar</button>
+          <button class="btn btn-ghost" id="roi-pile">Marcar pilha inteira</button>
+          <label class="switch"><input type="checkbox" id="roi-enabled"> aplicar ROI</label>
+        </div>
+        <div class="row mono small" id="roi-values">sem ROI</div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>Parâmetros</h2></div>
+        <form id="calib-form" class="form">
+          <label>Altura de uma cadeira (px)
+            <input type="number" name="chair_height_px" step="1" min="0" placeholder="0 = não calibrado">
+            <small>Medida real. Use “Medir cadeira” abaixo.</small>
+          </label>
+          <div class="row">
+            <button type="button" class="btn btn-ghost" id="measure-chair">Medir cadeira (desenhe 1 cadeira)</button>
+          </div>
+          <label>Limiar de detecção YOLO
+            <input type="number" name="confidence_threshold" step="0.05" min="0.05" max="0.99">
+          </label>
+          <label>Método de contagem
+            <select name="counting_method">
+              <option value="auto">auto (fusão de todos)</option>
+              <option value="periodicity">periodicity (padrão vertical)</option>
+              <option value="detections">detections (só YOLO)</option>
+              <option value="size">size (altura calibrada)</option>
+            </select>
+          </label>
+          <label>Estabilidade — janela (frames)
+            <input type="number" name="stability_frames" min="1" max="120">
+            <small>Quantos frames são observados antes de trocar o número.</small>
+          </label>
+          <label>Estabilidade — mínimo de concordância
+            <input type="number" name="stability_min_confidence" step="0.05" min="0" max="1">
+          </label>
+          <label>Estabilidade — frames para aceitar troca
+            <input type="number" name="change_min_frames" min="1" max="50">
+          </label>
+          <label>Confiança mínima da contagem
+            <input type="number" name="min_confidence" step="0.05" min="0" max="1">
+          </label>
+          <label>Offset de contagem
+            <input type="number" name="count_offset" step="1" min="-10" max="10">
+            <small>Corrige erro sistemático de ±1 cadeira.</small>
+          </label>
+          <label>Classes do modelo
+            <div class="row">
+              <input type="text" name="chair_classes" placeholder="chair">
+              <input type="text" name="pile_classes" placeholder="pile">
+            </div>
+          </label>
+          <div class="row">
+            <button class="btn btn-primary" type="submit">Salvar calibração</button>
+            <button class="btn btn-ghost" type="button" id="calib-reset">Restaurar padrão</button>
+          </div>
+        </form>
+        <div id="offset-suggestion" class="note"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h2>Diagnóstico do contador</h2>
+        <span class="hint">veja o que o algoritmo enxerga numa ROI</span></div>
+      <div class="row">
+        <button class="btn" id="diag-run">Analisar ROI selecionada</button>
+        <span class="hint" id="diag-summary"></span>
+      </div>
+      <div id="diag-out" class="diag-out"></div>
+    </div>
+  </section>
+
+  <!-- ---------------------------------------------- DATASET -->
+  <section class="page hidden" id="page-dataset">
+    <div class="stats-row four">
+      <div class="stat"><div class="stat-value" id="ds-total">0</div><div class="stat-label">IMAGENS</div></div>
+      <div class="stat"><div class="stat-value ok" id="ds-annotated">0</div><div class="stat-label">ANOTADAS</div></div>
+      <div class="stat"><div class="stat-value warn" id="ds-pending">0</div><div class="stat-label">PENDENTES</div></div>
+      <div class="stat"><div class="stat-value" id="ds-raw">0</div><div class="stat-label">BRUTAS</div></div>
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-head"><h2>Divisão do dataset</h2></div>
+        <p class="muted">A divisão é aleatória e <strong>reproduzível</strong>: a mesma
+           seed gera sempre a mesma divisão, o que permite comparar dois treinamentos.</p>
+        <form id="split-form" class="form">
+          <div class="row three">
+            <label>Treino<input type="number" name="train" step="0.01" value="0.70" min="0" max="1"></label>
+            <label>Validação<input type="number" name="val" step="0.01" value="0.20" min="0" max="1"></label>
+            <label>Teste<input type="number" name="test" step="0.01" value="0.10" min="0" max="1"></label>
+          </div>
+          <label>Seed <input type="number" name="seed" value="42"></label>
+          <div class="row">
+            <button class="btn btn-primary" type="submit">Dividir dataset</button>
+            <button class="btn btn-ghost" type="button" id="upload-btn">Enviar imagens</button>
+            <input type="file" id="upload-input" accept="image/*" multiple class="hidden">
+            <button class="btn btn-ghost" type="button" id="import-folder">Importar pasta</button>
+          </div>
+        </form>
+        <div id="split-result" class="note"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>Distribuição</h2></div>
+        <table class="table small" id="ds-split-table">
+          <thead><tr><th>Divisão</th><th>Imagens</th><th>Anotadas</th><th>Caixas</th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <div class="card-head" style="margin-top:14px"><h2>Caixas por classe</h2></div>
+        <table class="table small" id="ds-class-table"><tbody></tbody></table>
+        <div id="ds-warnings" class="note"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h2>Arquivos</h2><span class="hint" id="ds-yaml"></span></div>
+      <code class="code-block" id="ds-structure"></code>
+    </div>
+  </section>
+
+  <!-- ---------------------------------------------- ANOTAÇÃO -->
+  <section class="page hidden" id="page-annotation">
+    <div class="card">
+      <div class="card-head">
+        <h2>Imagens para anotar</h2>
+        <div class="card-actions">
+          <span class="hint" id="ann-summary"></span>
+          <button class="btn btn-primary" id="ann-open">Abrir ferramenta de anotação</button>
+        </div>
+      </div>
+      <div class="note">
+        O sistema usa o padrão <strong>YOLO</strong> (um <code>.txt</code> por imagem).
+        Para anotar graficamente, use o <strong>CVAT</strong> (gratuito e local) ou o
+        <strong>Label Studio</strong> — veja o README, seção “Como anotar”.
+        O botão abaixo mostra os comandos prontos.
+      </div>
+      <div id="ann-help" class="hidden">
+        <pre class="code-block"># 1. Instale e suba o CVAT (Docker) — veja https://docs.cvat.ai
+# 2. Crie um projeto do tipo "CVAT for images 1.1" com 1-2 classes: chair (e pile)
+# 3. Importe as imagens de training/datasets/raw/
+# 4. Exporte em "CVAT for images 1.1" → depois converta para YOLO:
+#
+# O repositório traz um conversor pronto:
+#   python -m training.scripts.prepare_dataset --from-cvat export.xml
+#
+# Alternativa sem Docker: Label Studio
+#   pip install label-studio
+#   label-studio start
+#   e use o conversor: python -m training.scripts.prepare_dataset --from-labelstudio export.json</pre>
+      </div>
+      <div class="table-scroll">
+        <table class="table small" id="ann-table">
+          <thead><tr><th>Imagem</th><th>Divisão</th><th>Situação</th><th>Caixas</th><th>Ver</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ---------------------------------------------- TREINAMENTO -->
+  <section class="page hidden" id="page-training">
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-head"><h2>Novo treinamento</h2></div>
+        <div id="gpu-report" class="note mono"></div>
+        <form id="train-form" class="form">
+          <label>Modelo base
+            <input type="text" name="model" value="yolo11n.pt" list="model-list">
+            <datalist id="model-list">
+              <option value="yolo11n.pt"><option value="yolo11s.pt"><option value="yolo11m.pt">
+              <option value="yolov8n.pt"><option value="yolov8s.pt">
+            </datalist>
+          </label>
+          <div class="row">
+            <label>Épocas<input type="number" name="epochs" value="100" min="1"></label>
+            <label>Batch<input type="number" name="batch" value="16"></label>
+          </div>
+          <div class="row">
+            <label>Image size<input type="number" name="image_size" value="640" step="64"></label>
+            <label>Workers<input type="number" name="workers" value="4" min="0"></label>
+          </div>
+          <label>Device
+            <input type="text" name="device" placeholder="auto">
+            <small>auto, cpu, cuda, 0</small>
+          </label>
+          <div class="row">
+            <button class="btn btn-primary" type="submit" id="train-start">INICIAR TREINAMENTO</button>
+            <button class="btn btn-danger" type="button" id="train-stop">Parar</button>
+          </div>
+        </form>
+        <div id="train-msg" class="note"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>Progresso</h2><span id="train-state" class="pill pill-offline">parado</span></div>
+        <div class="progress"><div id="train-bar" class="progress-bar" style="width:0%"></div></div>
+        <div id="train-epoch" class="train-epoch">—</div>
+        <table class="table small" id="train-metrics"><tbody></tbody></table>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h2>Saída do treinamento</h2>
+        <button class="btn btn-ghost" id="train-refresh-log">Atualizar log</button></div>
+      <pre class="code-block" id="train-log">sem treinamento executado ainda.</pre>
+    </div>
+  </section>
+
+  <!-- ---------------------------------------------- MODELO -->
+  <section class="page hidden" id="page-model">
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-head"><h2>Modelo em produção</h2></div>
+        <table class="table" id="active-model"><tbody></tbody></table>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>Dispositivo</h2></div>
+        <div id="gpu-info" class="note mono"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h2>Versões</h2>
+        <div class="card-actions">
+          <button class="btn btn-ghost" id="model-import">Importar .pt</button>
+          <input type="file" id="model-file" accept=".pt" class="hidden">
+          <button class="btn btn-ghost" id="model-rollback">Voltar ao anterior</button>
+        </div>
+      </div>
+      <div class="table-scroll">
+        <table class="table" id="models-table">
+          <thead><tr>
+            <th>Arquivo</th><th>Versão</th><th>Treinado em</th>
+            <th>Precision</th><th>Recall</th><th>mAP50</th><th>mAP50-95</th><th>Status</th><th></th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="note">
+        As métricas acima são <strong>reais</strong>, lidas de <code>results.csv</code> do
+        treinamento correspondente. Modelo sem treino aparece com “—”: nada é inventado.
+      </div>
+    </div>
+  </section>
+
+  <!-- ---------------------------------------------- CONFIGURAÇÕES -->
+  <section class="page hidden" id="page-settings">
+    <div class="card">
+      <div class="card-head"><h2>Configuração efetiva</h2>
+        <button class="btn btn-ghost" id="cfg-refresh">Atualizar</button></div>
+      <div class="note">A URL RTSP aparece <strong>mascarada</strong>: a senha nunca
+        vai para o navegador. Tudo vem do arquivo <code>.env</code>.</div>
+      <pre class="code-block" id="cfg-out">carregando…</pre>
+    </div>
+    <div class="card">
+      <div class="card-head"><h2>Câmeras cadastradas</h2></div>
+      <div class="table-scroll">
+        <table class="table" id="cams-table">
+          <thead><tr><th>#</th><th>Nome</th><th>URL (mascarada)</th><th>Ativa</th><th>Padrão</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ---------------------------------------------- LOGS -->
+  <section class="page hidden" id="page-logs">
+    <div class="card">
+      <div class="card-head">
+        <h2>Logs do sistema</h2>
+        <div class="card-actions">
+          <select id="log-file" class="sel">
+            <option value="app.log">app.log</option>
+            <option value="camera.log">camera.log</option>
+            <option value="ai.log">ai.log</option>
+            <option value="training.log">training.log</option>
+            <option value="training_latest.log">training_latest.log</option>
+          </select>
+          <button class="btn btn-ghost" id="log-refresh">Atualizar</button>
+          <button class="btn btn-ghost" id="events-clear">Limpar eventos do banco</button>
+        </div>
+      </div>
+      <pre class="code-block" id="log-out"></pre>
+    </div>
+    <div class="card">
+      <div class="card-head"><h2>Eventos registrados</h2></div>
+      <div class="table-scroll">
+        <table class="table small" id="events-table">
+          <thead><tr><th>Data/Hora</th><th>Nível</th><th>Evento</th><th>Mensagem</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<!-- toast -->
+<div id="toast" class="toast hidden"></div>
+<!-- modal de confirmação -->
+<div id="modal" class="modal hidden">
+  <div class="modal-box">
+    <h3 id="modal-title">Confirmar</h3>
+    <p id="modal-text"></p>
+    <div class="row end">
+      <button class="btn btn-ghost" id="modal-no">Cancelar</button>
+      <button class="btn btn-danger" id="modal-yes">Confirmar</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/js/dashboard.js"></script>
+</body>
+</html>

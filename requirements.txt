@@ -1,0 +1,39 @@
+# ============================================================================
+# CONTADOR DE CADEIRAS - Dependências de Produção
+# ----------------------------------------------------------------------------
+# Instalação:  pip install -r requirements.txt
+# ============================================================================
+
+# --- Web / API --------------------------------------------------------------
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+jinja2==3.1.5
+python-multipart==0.0.20
+python-dotenv==1.0.1
+pydantic==2.10.5
+pydantic-settings==2.7.1
+
+# --- Banco de dados ---------------------------------------------------------
+SQLAlchemy==2.0.37
+# PostgreSQL é suportado via variável DATABASE_URL (driver opcional):
+# psycopg[binary]==3.2.3
+
+# --- Visão computacional / IA ----------------------------------------------
+# Ultralytics já declara torch e torchvision como dependência, mas fixamos
+# aqui a variante CPU para não baixar ~2.5GB de CUDA sem necessidade.
+# PARA USAR GPU NVIDIA: troque as duas linhas abaixo pelos comandos do README
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+#
+# NOTA sobre OpenCV: o Ultralytics exige "opencv-python" (com GUI), mas em
+# servidor headless isso traz dependências de X11 desnecessárias. Por isso
+# instalamos o Ultralytics com --no-deps e usamos só o headless. Se você
+# rodar `pip install -r requirements.txt` e o Ultralytics for listado antes,
+# use o comando do run.sh, que já faz a instalação na ordem correta.
+ultralytics==8.3.60
+opencv-python-headless==4.10.0.84
+numpy==1.26.4
+
+# --- Utilitários ------------------------------------------------------------
+httpx==0.28.1
+psutil==6.1.1
+aiofiles==24.1.0
