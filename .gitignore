@@ -11,7 +11,7 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-
+*.mp4
 # Dados de execução (regeneráveis)
 data/chairs.db
 data/chairs.db-wal
