@@ -9,6 +9,21 @@ O ONNX é o mais útil: roda em qualquer máquina, inclusive sem GPU e sem
 PyTorch instalado no servidor de produção.
 """
 
+# =============================================================================
+# ARQUIVO / MAPA  -  training/scripts/export.py
+#
+# O que faz: converte o best.pt (.pt do PyTorch) em outro formato (onnx,
+#   coreml, tflite...). É OPCIONAL: o sistema atual roda o .pt direto.
+#   Serve para quem precisa rodar em máquina sem PyTorch, ou quer NVIDIA
+#   TensorRT (engine) para inference mais rápida na GPU.
+#
+# Ordem de leitura:
+#   1. find_best ..... qual arquivo exportar (--weights, run mais recente, .env)
+#   2. main() ........ CLI -> export() -> moves o arquivo -> mostra o tamanho
+#
+# Aviso: exportar não melhora o modelo. Mesmos pesos, outro formato.
+# =============================================================================
+
 from __future__ import annotations
 
 import argparse
@@ -23,6 +38,7 @@ from app.config import settings  # noqa: E402
 
 
 def find_best() -> Path | None:
+    """Escolhe o que exportar quando --weights não foi informado."""
     runs = ROOT / settings.training.project
     cands = [
         d / "weights" / "best.pt"
@@ -30,7 +46,11 @@ def find_best() -> Path | None:
         if d.is_dir() and (d / "weights" / "best.pt").is_file()
     ]
     if cands:
+        # O mais recente por mtime. Ver validate.py: "mais recente" não é
+        # necessariamente "melhor".
         return max(cands, key=lambda x: x.stat().st_mtime)
+    # Sem runs, tenta o modelo do .env (pode ser o genérico yolo11n.pt, que
+    # exporta, mas não serve para contar pilhas).
     if settings.model_path.is_file():
         return settings.model_path
     return None
@@ -63,8 +83,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         out = model.export(
             format=args.format,
+            # imgsz fica FIXADO na exportação: um ONNX 640 não aceita entrada
+            # 1280 depois. Se a câmera mudar de resolução, reexporte.
             imgsz=args.imgsz,
+            # FP16 só faz sentido em GPU: em CPU não há ganho e ainda quebra
+            # alguns runtimes. Por isso o `and` com o device resolvido.
             half=args.half and settings.resolve_device().startswith("cuda"),
+            # simplify passa o grafo pelo onnxslim: arquivo menor e mais rápido.
             simplify=True,
         )
     except Exception as exc:
@@ -75,10 +100,13 @@ def main(argv: list[str] | None = None) -> int:
         print("  ou exporte apenas 'onnx' que é o caso mais útil.")
         return 1
 
+    # O Ultralytics devolve o caminho e sempre escreve do lado do .pt.
     dest = Path(str(out))
     if args.out:
         target = Path(args.out)
         target.parent.mkdir(parents=True, exist_ok=True)
+        # replace() move o arquivo; se for o mesmo caminho, não faz nada
+        # (substituir por si mesmo levantaria erro).
         dest.replace(target) if dest != target else None
         dest = target
     print(f"\nExportado com sucesso: {dest}")

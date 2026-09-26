@@ -2,11 +2,61 @@
    CONTADOR DE CADEIRAS — dashboard (sem frameworks)
    - WebSocket /ws  -> estado em tempo real
    - fetch /api/*   -> ações e páginas
-   ========================================================================= */
+   =========================================================================
+
+   ARQUIVO / MAPA — static/js/dashboard.js
+   Um arquivo só, sem build, sem framework. O navegador carrega, roda o
+   boot() no DOMContentLoaded e pronto.
+
+   Duas fontes de dado, com responsabilidades bem separadas:
+     - WebSocket: TEMPO REAL. O backend empurra um snapshot de estado
+       (pilhas, total, confiança, câmera, alertas) várias vezes por
+       segundo. É o que mantém a aba Dashboard viva sem polling.
+     - fetch: AÇÃO E PÁGINA. Só quando o usuário clica em algo ou troca de
+       aba. Nenhuma aba faz polling de tabela, exceto Treinamento.
+   A imagem nunca passa por aqui: é o <img src="/api/stream.mjpg"> do HTML.
+
+   Ordem de leitura (por aba, seguindo o dashboard):
+     0. Infraestrutura   estado S, helpers $, toast, modal, api(), WS,
+                         applyState e as funções de pintura do cabeçalho
+     1. Vídeo/Dashboard  updateHeader, updateTotals, updateAlerts,
+                         renderPiles, saveCorrection
+     2. Câmera           loadCamera + troca com/sem overlay
+     3. Contagem         loadCounting (correções e offset sugerido)
+     4. Histórico        loadHistory, exportação CSV
+     5. Calibração       loadCalibration, ROI no canvas, diagnóstico
+     6. Dataset          loadDataset, divisão, upload
+     7. Anotação         loadAnnotation
+     8. Treinamento      loadTraining, polling e log
+     9. Modelo           loadModels, ativar, rollback, importar
+     10. Histórico/Config loadSettings
+     11. Logs            loadLogs, eventos ao vivo
+     12. Roteamento      TITLES, LOADERS, route()
+     13. Início          boot()
+
+   Duas decisões que valem lembrar antes de mexer em qualquer função:
+     - applyState() só redesenha as listas de pilhas quando a assinatura
+       (id:contagem:status) muda. Sem isso, o campo de correção manual
+       perderia o foco a cada frame e o digito sumiria.
+     - Quase todo texto que vem da API entra por textContent, não innerHTML.
+       Só listas montadas por concatenação usam innerHTML. Dados de log e de
+       frame são os mais expostos a "<" e "&".
+*/
 
 'use strict';
 
 // ------------------------------------------------------------------ estado
+/*
+  Objeto único com todo o estado mutável do front-end. Existe para evitar
+  vazamento de global e para o roteador poder ler de um lugar só.
+  - ws/wsRetry: conexão e contador de tentativas de reconexão
+  - state: último snapshot do backend (piles fica junto, por conveniência)
+  - page: aba atual. Vários trechos param de trabalhar se a aba não estiver
+    visível — é o throttle mais barato que existe aqui (evita renderizar
+    lista que ninguém está olhando).
+  - roi: {x,y,w,h} em pixels DO FRAME (não da tela). Por isso a ROI continua
+    valendo depois de redimensionar a janela.
+*/
 const S = {
   ws: null,
   wsRetry: 0,
@@ -21,12 +71,22 @@ const S = {
   charts: {},
 };
 
+// Helpers mínimos. $, $$ e fmt existem para escrever menos e para ter UM
+// lugar de normalizar dado incompleto: fmt(null), fmt(undefined) e fmt(NaN)
+// devolvem "—" em vez de "NaN" na tela. Isso importa muito aqui, porque a
+// API pode omitir campos e um "NaN" na tela parece erro do sistema.
+// pct() é separado de fmt() de propósito: confiança chega como 0..1 e o
+// valor mostrado é sempre inteiro em %.
 const $  = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
 const fmt = (v, d = 0) => (v === null || v === undefined || isNaN(v)) ? '—' : Number(v).toFixed(d);
 const pct = v => Math.round((v || 0) * 100);
 
 // ------------------------------------------------------------------ toast
+// Aviso efêmero. textContent (e não innerHTML) porque a mensagem costuma
+// vir do backend e pode conter "<" ou "&": innerHTML interpretaria como
+// marcação. O timer anterior é cancelado a cada chamada, então mensagens
+// seguidas não se sobrepõem.
 let toastTimer = null;
 function toast(msg, kind = '') {
   const el = $('#toast');
@@ -37,6 +97,9 @@ function toast(msg, kind = '') {
 }
 
 // ------------------------------------------------------------------ modal
+// Confirmação vira Promise para o chamador ler como if/else, sem callback.
+// Os handlers são limpos (onclick = null) ao resolver: sem isso, o botão
+// guardaria a Promise antiga e um clique duplo dispararia duas vezes.
 function confirmDialog(title, text) {
   return new Promise(resolve => {
     const m = $('#modal');
@@ -51,11 +114,17 @@ function confirmDialog(title, text) {
 }
 
 // ------------------------------------------------------------------ fetch
+// Wrapper único de rede. Concentrar aqui significa que TODA chamada trata
+// erro do mesmo jeito e que nenhuma tela precisa lidar com HTTP cru.
 async function api(path, opts = {}) {
   const res = await fetch(path, {
     headers: { 'Content-Type': 'application/json' },
     ...opts,
   });
+  // Resposta sem JSON (ex.: 502 do proxy, página de erro) não pode quebrar
+  // o chamador: cai no statusText. E o throw abaixo transforma erro HTTP em
+  // exceção com mensagem em português vinda do backend, que o catch de cada
+  // tela mostra no toast.
   let body = {};
   try { body = await res.json(); } catch (e) { body = { ok: false, message: res.statusText }; }
   if (!res.ok) throw new Error(body.message || ('HTTP ' + res.status));
@@ -63,6 +132,21 @@ async function api(path, opts = {}) {
 }
 
 // ==================================================================== WS ===
+/*
+  Ponto único de tempo real. msg.type decide o destino:
+    hello -> snapshot inicial; já vem renderizado por applyState depois,
+             então aqui só é ignorado para não pintar duas vezes
+    state -> o trabalho de verdade
+    event -> linha nova na aba Logs
+
+  A reconexão é exponencial e SEM "jitter" (500ms * 1.7^tentativa, teto 6).
+  Serve para não martelar o servidor quando a rede cai, mas sofre com muitos
+  dashboards subindo juntos (thundering herd) — se isso virar problema, o
+  próximo passo é sortear um atraso aleatório nessa base.
+
+  onerror chama close() de propósito: o caminho de reconexão é sempre o
+  onclose, então existe um único lugar que sabe reconectar.
+*/
 function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const ws = new WebSocket(`${proto}://${location.host}/ws`);
@@ -89,28 +173,66 @@ function connectWS() {
   ws.onerror = () => { try { ws.close(); } catch (e) {} };
 }
 
+/*
+  Coração do dashboard: roda a cada snapshot do backend (várias vezes por
+  segundo). A ordem das chamadas importa.
+
+  A ASSINATURA (sig) é a otimização central do arquivo. O estado chega
+  completo a cada frame, mas as listas só são reconstruídas quando muda
+  pilha:contagem:status. Sem isso, a cada 200ms o innerHTML da lista seria
+  reescrito e:
+    - o campo de correção manual perderia o foco e o valor digitado sumiria;
+    - a lista piscaria, impossível de clicar numa pilha;
+    - o custo de layout cresceria sem necessidade.
+  O que muda o tempo todo (fps, uptime, latência) não entra na assinatura de
+  propósito: é por isso que esses números podem mudar sem redesenhar nada.
+
+  _sig fica na própria função como memória entre chamadas (evita colocar
+  no estado global). Se applyState for chamada sem argumento isso quebra,
+  então quem chama sempre passa o snapshot.
+*/
 function applyState(st) {
   S.state = st;
   const piles = st.piles || [];
+  // Um modelo genérico pré-treinado (COCO) não foi feito para este ambiente:
+  // ele enxerga a PILHA INTEIRA como se fosse uma cadeira. As contagens que saem
+  // daí medem textura (ripas do encosto, nervuras das pernas), não cadeiras -
+  // por isso o número varia e a confiança pode ficar alta por engano.
+  //
+  // O backend já manda `model_trained` no payload. Sem modelo treinado, nenhum
+  // número é medição, independente do que a confiança dizer.
+  const measurable = !!st.model_trained;
   // Só redesenha as listas se a pilha mudou (evita piscar)
-  const sig = piles.map(p => `${p.pile_id}:${p.count}:${p.status}`).join('|');
-  if (sig !== applyState._sig) { applyState._sig = sig; renderPiles(piles); renderCountTable(piles); }
+  const sig = measurable + '|' + piles.map(p => `${p.pile_id}:${p.count}:${p.status}`).join('|');
+  if (sig !== applyState._sig) { applyState._sig = sig; renderPiles(piles, measurable); renderCountTable(piles); }
   updateTotals(st);
   updateHeader(st);
   updateAlerts(st.alerts || []);
+  // O gráfico só cresce na aba Dashboard: os outros canvases são recarregados
+  // sob demanda pelo load*() da própria aba.
   if (S.page === 'dashboard') pushChartPoint(st);
+  // Primeiro estado = primeiro frame recebido. O "aguardando…" some aqui.
   $('#video-empty')?.classList.add('hidden');
   $('#video2-empty')?.classList.add('hidden');
 }
 
+/*
+  Cabeçalho e indicadores. Tudo por textContent: são valores vindos da API.
+  Regra de ouro do painel aqui: valor ausente é "—", nunca 0. Zéro parece
+  uma medição e levaria o operador a conclusão errada.
+*/
 function updateHeader(st) {
   const cam = (st.camera_state || 'OFFLINE').toUpperCase();
   const pill = $('#cam-state-pill');
   pill.textContent = cam;
+  // Só três cores para o estado da câmera: conectada, em transição, fora.
+  // Qualquer estado desconhecido cai em "offline" — melhor pessimista.
   pill.className = 'pill ' + (cam === 'ONLINE' ? 'pill-online' : cam === 'CONNECTING' || cam === 'RECONNECTING' ? 'pill-warn' : 'pill-offline');
 
   $('#stat-camera').textContent = cam === 'ONLINE' ? 'ONLINE' : cam;
   $('#stat-piles').textContent = st.pile_count ?? 0;
+  // Confiança 0 vira "—", não "0%": zero aqui significa "não sei", e mostrar
+  // 0% faria o operador desconfiar de uma contagem que talvez esteja certa.
   $('#stat-conf').textContent = (st.confidence > 0 ? pct(st.confidence) + '%' : '—');
   $('#meta-fps').textContent = 'FPS ' + fmt(st.fps, 1);
   $('#meta-res').textContent = st.mode ? 'modo: ' + st.mode : '';
@@ -118,22 +240,38 @@ function updateHeader(st) {
   const badge = $('#mode-badge');
   const mode = st.mode || 'iniciando';
   badge.textContent = mode;
+  // production = verde (pode confiar no número). preparation = vermelho
+  // (câmera em ajuste, número não vale ainda). resto = âmbar.
   badge.className = 'badge ' + (mode.startsWith('production') ? 'badge-ok' : mode === 'preparation' ? 'badge-err' : 'badge-warn');
 }
 
+/*
+  O número mais importante da tela. A animação de escala só dispara quando o
+  texto realmente muda (guarda `el.textContent !== String(t)`), senão o total
+  pulsaria a cada frame e o movimento passaria a ser ruído, não sinal.
+*/
 function updateTotals(st) {
   const t = st.total ?? 0;
   const el = $('#total-value');
   if (el.textContent !== String(t)) {
     el.textContent = t;
     el.style.color = '#fff';
+    // Web Animations API: sem CSS extra, e some sozinha no fim.
     el.animate([{ transform: 'scale(1.10)', color: '#3ec93e' }, { transform: 'scale(1)', color: '#fff' }], { duration: 420 });
   }
+  // "tentativo" é o total que teria se as pilhas instáveis adotassem a
+  // estimativa mais alta. Fica separado do total firme para o operador
+  // enxergar o tamanho da incerteza.
   const tt = st.totals || {};
   $('#total-tentative').textContent = tt.total_tentative ? `(+${tt.total_tentative} instável)` : 'todas estáveis';
   $('#total-piles').textContent = `${st.pile_count || 0} pilha(s)`;
 }
 
+/*
+  Alertas. A barra é esvaziada e reescrita a cada estado: é uma lista
+  instantânea do backend, não um histórico. O ícone vem do nível, e
+  textContent evita que a mensagem do backend vire HTML.
+*/
 function updateAlerts(alerts) {
   const bar = $('#alerts-bar');
   bar.innerHTML = '';
@@ -146,9 +284,32 @@ function updateAlerts(alerts) {
 }
 
 // ------------------------------------------------------------- pilhas (cards)
+/*
+  Mapa estado -> classe de tag. Este é o MESMO dicionário de cores do
+  overlay desenhado no frame (counting/confidence.py, STATUS_COLORS_HEX):
+  se a caixa do vídeo é verde, a linha da lista também é. Uma cor, uma
+  verdade, mesmo significado no vídeo e na tabela.
+  Estado novo vindo do backend cai em tag-unk em vez de quebrar o layout.
+*/
 const STATUS_TAG = { STABLE: 'tag-ok', UNSTABLE: 'tag-warn', LOW_CONFIDENCE: 'tag-low', PARTIAL: 'tag-part', UNKNOWN: 'tag-unk' };
 
-function renderPiles(piles) {
+/*
+  Cartões de pilha do Dashboard. Só é chamada quando a assinatura muda
+  (ver applyState), então aqui não existe throttle: a proteção está na
+  frente.
+
+  O HTML é montado por template string com valores que vêm da API. Isso
+  seria um problema de XSS se os valores fossem texto livre do usuário —
+  aqui os campos numéricos e o status são controlados pelo backend, e o
+  único texto livre (o nome da classe na estimativa) vem do próprio
+  detector. Se um dia entrar nome de arquivo ou comentário do operador
+  neste template, tem que escapar antes.
+
+  O "detail" mostra os estimadores candidatos lado a lado (ex.: size=7
+  periodicity=8). É o dado mais útil em campo: quando a IA erra, o motivo
+  quase sempre é visível na divergência entre eles.
+*/
+function renderPiles(piles, measurable) {
   const box = $('#piles-list');
   if (!piles.length) { box.innerHTML = '<div class="empty">Nenhuma pilha detectada.</div>'; return; }
   box.innerHTML = '';
@@ -156,12 +317,28 @@ function renderPiles(piles) {
     const row = document.createElement('div');
     row.className = 'pile s-' + p.status;
     const est = Object.entries(p.candidates || {}).map(([k, v]) => `${k}=${Math.round(v)}`).join(' ');
+    // Só mostra o número quando o backend diz que ele é confiável.
+    //
+    // O backend já calcula isso (confidence.combine -> `uncertain`; o
+    // PileState chega como `status`), mas antes este arquivo renderizava
+    // `p.count` sempre. Resultado: uma leitura que o próprio sistema
+    // classificava como LOW_CONFIDENCE aparecia na tela com a mesma
+    // prominence de uma medida, e era anotada no papel como se fosse real.
+    //
+    // Um número grande e errado é pior que "?" - o "?" diz ao operador que
+    // ele precisa de modelo treinado ou de calibração, o número não diz nada.
+    const trusted = measurable && (p.status === 'STABLE' || p.status === 'PARTIAL');
+    // O valor bruto continua na linha de detalhe (e no input do stepper):
+    // o operador precisa enxergar o que a IA pensou para poder corrigir, e
+    // o stepper precisa de um número para funcionar.
+    const shown = trusted ? p.count : '?';
+    const tentative = trusted ? '' : ` · leitura ${p.count}`;
     row.innerHTML = `
       <div class="pile-id">PILHA ${p.pile_id}</div>
-      <div class="pile-count">${p.count}</div>
+      <div class="pile-count" title="${trusted ? 'Contagem estabilizada' : 'Leitura não confiável: o número não foi validado'}">${shown}</div>
       <div class="pile-info">
         <div class="pile-status">${statusLabel(p.status)}</div>
-        <div class="pile-detail">${est || 'sem estimadores'}${p.manual ? ' · manual' : ''}</div>
+        <div class="pile-detail">${est || 'sem estimadores'}${tentative}${p.manual ? ' · manual' : ''}</div>
       </div>
       <div class="pile-conf">${pct(p.confidence)}%</div>
       <div class="stepper">
@@ -171,21 +348,40 @@ function renderPiles(piles) {
       </div>`;
     box.appendChild(row);
   });
+  // Handlers reaproveitados a cada redesenho. Como o innerHTML substitui tudo
+  // de uma vez, não há vazamento de listener antigo: os nós antigos morrem
+  // junto com seus handlers. Delegação seria mais barata aqui.
   box.querySelectorAll('.stepper button').forEach(b => {
     b.onclick = () => {
       const input = b.parentElement.querySelector('input');
+      // Math.max(0, ...): não existe pilha negativa, e o input pode estar
+      // vazio quando o usuário está digitando (parseInt devolve NaN).
       input.value = Math.max(0, (parseInt(input.value, 10) || 0) + parseInt(b.dataset.d, 10));
     };
   });
+  // onchange (e não oninput): só salva quando o usuário sai do campo, o que
+  // também evita chamar o modal de confirmação a cada tecla digitada.
   box.querySelectorAll('.stepper input').forEach(inp => {
     inp.onchange = () => saveCorrection(inp.dataset.id, parseInt(inp.value, 10));
   });
 }
 
+// Traduz o estado técnico para português. Fallback devolve o próprio valor
+// de entrada: estado novo da API aparece cru em vez de "undefined" na tela.
 function statusLabel(s) {
   return { STABLE: 'ESTÁVEL', UNSTABLE: 'INSTÁVEL', LOW_CONFIDENCE: 'BAIXA CONFIANÇA', PARTIAL: 'PARCIAL', UNKNOWN: 'INDETERMINADO' }[s] || s;
 }
 
+/*
+  Correção manual: o dado mais valioso do sistema inteiro. Cada confirmação
+  grava o par (o que a IA viu, o que era verdade) no banco, e é esse
+  histórico que alimenta o offset sugerido e, depois, um retreinamento.
+
+  Por isso a confirmação mostra os DOIS números e avisa do registro. Sem
+  esse texto o operador corrigiria sem saber que está gerando dado de treino.
+  Valores abaixo de zero ou não numéricos são descartados aqui, e não no
+  backend, para nem gastar ida ao servidor.
+*/
 async function saveCorrection(pileId, value) {
   if (isNaN(value) || value < 0) return;
   const p = S.piles.find(x => x.pile_id == pileId);
@@ -200,6 +396,19 @@ async function saveCorrection(pileId, value) {
 }
 
 // ------------------------------------------------------------- tabela
+/*
+  Tabela detalhada da aba Contagem. Também é alimentada pelo WebSocket
+  (mesmo guardião de assinatura do Dashboard), então aparece preenchida
+  mesmo sem abrir a aba. É a visão "por que a IA disse N" — cada coluna
+  é uma peça do cálculo:
+
+    method                qual estimador venceu a fusão
+    detection_confidence  o YOLO viu a pilha com certeza
+    stability_confidence  os últimos frames concordaram entre si
+    pitch_px              distância entre cadeiras; sem padrão vertical
+                          estável não há como contar por periodicidade
+    manual                sinal de que alguém já corrigiu à mão
+*/
 function renderCountTable(piles) {
   const tb = $('#count-table tbody');
   if (!piles.length) { tb.innerHTML = '<tr><td colspan="9" class="empty">sem pilhas</td></tr>'; return; }
@@ -218,6 +427,13 @@ function renderCountTable(piles) {
 }
 
 // ================================================================ CHARTS ===
+/*
+  Chart.js vem de CDN e é a ÚNICA dependência externa do sistema. O app
+  precisa funcionar numa rede de fábrica, então o onerror não faz nada
+  visível: apenas chama o callback, makeChart devolve null e cada
+  atualização de gráfico já checa "se o chart existe". Resultado: o vídeo e
+  as contagens continuam funcionando sem internet, só sem gráficos.
+*/
 function loadChartJs(cb) {
   if (window.Chart) return cb();
   const s = document.createElement('script');
@@ -233,6 +449,9 @@ function makeChart(id, color) {
   const ctx = cv.getContext('2d');
   const grad = ctx.createLinearGradient(0, 0, 0, cv.height);
   grad.addColorStop(0, color + '55'); grad.addColorStop(1, color + '00');
+  // animation:false e update('none') lá embaixo: com dados chegando várias
+  // vezes por segundo, animar cada ponto consome CPU e a linha parece
+  // "escorregar". Um gráfico de operação deve ser estático e imediato.
   return new Chart(ctx, {
     type: 'line',
     data: { labels: [], datasets: [{ label: 'Total de cadeiras', data: [], borderColor: color, backgroundColor: grad, fill: true, tension: .28, pointRadius: 0, borderWidth: 2 }] },
@@ -254,6 +473,13 @@ function initCharts() {
   S.charts.history = makeChart('chart-history', '#f0c828');
 }
 
+/*
+  Gráfico ao vivo do Dashboard. Recebe um ponto por estado do WebSocket e
+  mantém no máximo 180 em S.lastHist — esse teto é a única forma de o
+  gráfico não crescer sem limite durante um turno de 8h.
+  A janela desejada (60/600/3600) é lida do select a cada ponto, então
+  trocar a faixa não redesenha nem recarrega nada.
+*/
 function pushChartPoint(st) {
   const now = new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
   S.lastHist.push({ t: now, v: st.total ?? 0 });
@@ -266,9 +492,21 @@ function pushChartPoint(st) {
   ch.update('none');
 }
 
+// Listener intencionalmente vazio: o select é lido no próximo ponto por
+// pushChartPoint. Existe só para documentar que a troca de faixa é local.
 $('#chart-range')?.addEventListener('change', () => { /* próximo ponto já respeita o range */ });
 
 // ============================================================ PAGE: CÂMERA ===
+/*
+  Diagnóstico da conexão (GET /api/cameras + GET /api/status), só ao abrir a
+  aba. Listar o que separa "câmera ruim" de "contagem ruim":
+    FPS da fonte vs. FPS de processamento -> se o processing FPS é menor,
+      o gargalo é a inferência, não a câmera
+    frames perdidos / inválidos -> rede ruim ou codec
+    reconexões -> instabilidade de rede ou servidor RTSP caindo
+    latência de captura -> na verdade é o tempo de INFERÊNCIA medido; o
+      rótulo é o mais próximo que o painel tem
+*/
 async function loadCamera() {
   try {
     const r = await api('/api/cameras');
@@ -293,6 +531,15 @@ async function loadCamera() {
   } catch (e) { toast(e.message, 'err'); }
 }
 
+/*
+  Alterna entre o stream com overlay e o frame JPEG sem overlay.
+  Detalhes que não são óbvios:
+    - o src é limpo antes de ser trocado. Sem isso, o navegador às vezes
+      mantém a imagem anterior e o usuário acha que o botão não funcionou.
+    - só o modo SEM overlay recebe ?t=Date.now(). O stream MJPEG não é
+      cacheado assim, mas o frame único JPEG é: sem o parâmetro, o
+      navegador mostraria sempre a mesma imagem antiga.
+*/
 $('#toggle-overlay')?.addEventListener('click', (e) => {
   S.overlay = !S.overlay;
   e.target.textContent = S.overlay ? 'Ver imagem original' : 'Ver com contagem';
@@ -302,6 +549,14 @@ $('#toggle-overlay')?.addEventListener('click', (e) => {
 });
 
 // ========================================================= PAGE: CONTAGEM ===
+/*
+  Estatísticas das correções manuais (GET /api/corrections?limit=50).
+  É a aba que responde "a IA está errando sempre para o mesmo lado?".
+  O erro médio absoluto mostra o tamanho do erro; a taxa de acerto exato
+  mostra quantas contagens não precisaram de nada. Se o erro médio for
+  sempre +1, o problema é o modelo de altura da cadeira (calibração), não
+  o detector.
+*/
 async function loadCounting() {
   try {
     const r = await api('/api/corrections?limit=50');
@@ -321,6 +576,9 @@ async function loadCounting() {
         }).join('')
       : '<tr><td colspan="4" class="empty">nenhuma correção registrada</td></tr>';
 
+    // A sugestão de offset só aparece com amostras suficientes. Com poucas
+    // correções, o backend marca confiável = não justamente para não
+    // aplicar um número achado no chute na aba Calibração.
     const sug = r.offset_suggestion || {};
     if (sug.samples) {
       $('#offset-suggestion').textContent =
@@ -335,6 +593,15 @@ $('#btn-snapshot')?.addEventListener('click', async () => {
 });
 
 // ========================================================== PAGE: HISTÓRICO ===
+/*
+  Histórico vem do banco sob demanda (GET /api/history?hours=N), não do
+  WebSocket. Motivo: histórico é imutável, então consultar a cada frame só
+  gastaria CPU e latência sem trazer novidade.
+
+  No modo "personalizado" o intervalo é calculado em horas a partir das duas
+  datas. O .reverse() existe porque o banco devolve do mais novo para o mais
+  antigo e a tabela quer ordem cronológica; o gráfico usa a série como veio.
+*/
 async function loadHistory() {
   const sel = $('#hist-range').value;
   let hours = parseInt(sel, 10);
@@ -368,6 +635,8 @@ async function loadHistory() {
 }
 
 $('#hist-range')?.addEventListener('change', (e) => {
+  // Os campos de data só aparecem no modo custom. Nesse modo o load é
+  // adiado: espera o usuário escolher as duas datas.
   const custom = e.target.value === 'custom';
   $('#hist-from').classList.toggle('hidden', !custom);
   $('#hist-to').classList.toggle('hidden', !custom);
@@ -375,6 +644,13 @@ $('#hist-range')?.addEventListener('change', (e) => {
   loadHistory();
 });
 
+/*
+  Exportação CSV feita no navegador: monta a string, cria um Blob com
+  text/csv e dispara um <a download> temporário. Evita uma rota nova no
+  backend para um relatório de dados que já estão na tela.
+  Separador ";" em vez de "," porque o Excel em pt-BR trata a vírgula como
+  separador decimal e abriria o arquivo com todas as colunas grudadas.
+*/
 $('#hist-export')?.addEventListener('click', async () => {
   const hours = $('#hist-range').value === 'custom' ? 720 : parseInt($('#hist-range').value, 10);
   const r = await api(`/api/history?hours=${hours}`);
@@ -390,6 +666,14 @@ $('#hist-export')?.addEventListener('click', async () => {
 });
 
 // ========================================================== PAGE: CALIBRAÇÃO ===
+/*
+  Hidrata o formulário a partir de GET /api/calibration iterando as chaves
+  do objeto e casando com form.elements[nome]. Por isso o HTML é a fonte da
+  verdade dos campos: campo sem name= nunca é lido nem salvo.
+  Exceções explícitas (camera_id, updated_at, roi) são puladas porque são
+  só de leitura; a flag "enabled" mora no checkbox roi_enabled e é
+  copiada na mão.
+*/
 async function loadCalibration() {
   try {
     const r = await api('/api/calibration');
@@ -413,6 +697,14 @@ async function loadCalibration() {
   } catch (e) { toast(e.message, 'err'); }
 }
 
+/*
+  Salvar calibração. Diferente das outras abas, o payload é montado campo a
+  campo à mão em vez de serializar o form: os valores usam "+" para virar
+  número de verdade (um input vazio viraria NaN, que o JSON.stringify
+  transformaria em null) e a ROI vem de S.roi, que não é um input do
+  formulário. Send field-by-field também deixa explícito o contrato com a
+  API em vez de confiar em "serialize tudo que tem name".
+*/
 $('#calib-form')?.addEventListener('submit', async (ev) => {
   ev.preventDefault();
   const form = ev.target;
@@ -441,6 +733,13 @@ $('#calib-reset')?.addEventListener('click', async () => {
   loadCalibration(); toast('Calibração restaurada.', 'ok');
 });
 
+/*
+  Medir a altura de UMA cadeira: o usuário desenha a ROI de uma cadeira e o
+  backend devolve a altura em pixels. Esse número é a base do método "size"
+  (altura da pilha dividida pela altura da cadeira) e por isso é a
+  calibração mais valiosa do sistema. O envio de measure acontece agora, mas
+  o valor só vira oficial no POST do formulário.
+*/
 $('#measure-chair')?.addEventListener('click', async () => {
   if (!S.roi) { toast('Desenhe a caixa de UMA cadeira primeiro.', 'err'); return; }
   try {
@@ -450,6 +749,14 @@ $('#measure-chair')?.addEventListener('click', async () => {
   } catch (e) { toast(e.message, 'err'); }
 });
 
+/*
+  Diagnóstico: mostra o raciocínio do contador dentro da ROI, em grid.
+  É o painel de maior densidade de informação do projeto: passo vertical
+  detectado, camadas visíveis, razão extensão/passo (o quociente que dá a
+  contagem), qualidade do padrão, picos brutos e — o mais útil de todos —
+  a lista de reasons, que diz em português por que o contador desconfiou.
+  Não afeta produção: é leitura da imagem.
+*/
 $('#diag-run')?.addEventListener('click', async () => {
   if (!S.roi) { toast('Desenhe uma ROI primeiro.', 'err'); return; }
   try {
@@ -485,6 +792,19 @@ $('#roi-pile')?.addEventListener('click', async () => {
 });
 
 // -------- canvas de ROI
+/*
+  Desenho da ROI sobre um frame estático.
+
+  setupRoiCanvas é idempotente (cv._ready): loadCalibration pode rodar
+  várias vezes e, sem essa trava, cada visita à aba criaria outro
+  setInterval de 3s e outro conjunto de listeners. Uma imagem, um timer.
+
+  O setInterval de 3s só busca frame quando a aba de calibração está
+  visível. É um throttle por visibilidade: sem ele, o painel gastaria
+  requisições de JPEG o turno inteiro para uma imagem que ninguém vê.
+  Não há debounce na resposta: cada callback desenha por cima, e o
+  flicker é imperceptível a 3s.
+*/
 function setupRoiCanvas() {
   const cv = $('#roi-canvas');
   if (!cv || cv._ready) return;
@@ -498,6 +818,16 @@ function setupRoiCanvas() {
     img.src = '/api/frame.jpg?t=' + Date.now();
   }, 3000);
 
+  /*
+    Converte coordenada de tela para coordenada do frame. São três
+    correções encadeadas e todas necessárias:
+      1. subtrair o offset do elemento (r.left/r.top)
+      2. descontar a centralização do "contain" (o frame pode não ocupar a
+         largura toda do canvas)
+      3. dividir pela escala para voltar à resolução original
+    Sem a etapa 2 a ROI sairia deslocada em telas largas, que é o caso mais
+    comum (o vídeo é 16:9 dentro de um cartão mais alto).
+  */
   const pt = (ev) => {
     const r = cv.getBoundingClientRect();
     const nat = cv._img || { width: cv.width, height: cv.height };
@@ -509,6 +839,10 @@ function setupRoiCanvas() {
   };
   const down = (ev) => { ev.preventDefault(); const p = pt(ev); S.dragging = { x0: p.x, y0: p.y }; };
   const move = (ev) => {
+    // Sem throttle neste mousemove, de propósito: cada pixel do arrasto é
+    // um redesenho de canvas, que é barato (uma imagem e quatro retângulos)
+    // e é o que faz a caixa "grudar" no cursor. O throttle aqui daria
+    // sensação de Borrão. Só o estado é minimizado/desenhado, nunca atrasado.
     if (!S.dragging) return;
     ev.preventDefault();
     const p = pt(ev);
@@ -524,6 +858,9 @@ function setupRoiCanvas() {
       $('#roi-values').textContent = S.roi ? `ROI: x=${S.roi.x} y=${S.roi.y} w=${S.roi.w} h=${S.roi.h}` : 'sem ROI';
     }
   };
+  // mouseup e touchend ficam na window, não no canvas: soltar o botão
+  // FORA do canvas é o gesto mais comum e, se o listener morasse no canvas,
+  // o arraste ficaria travado com S.dragging sem fim.
   cv.addEventListener('mousedown', down); cv.addEventListener('mousemove', move);
   window.addEventListener('mouseup', up);
   cv.addEventListener('touchstart', down, { passive: false });
@@ -531,6 +868,15 @@ function setupRoiCanvas() {
   window.addEventListener('touchend', up);
 }
 
+/*
+  Pintura da ROI. Escurece o que está FORA da caixa com quatro retângulos
+  (em vez de recortar com save/clip), porque o recorte pediria redesenhar a
+  área interna a cada mousemove, e apagaria o trecho por onde o usuário
+  está arrastando.
+  As dimensões do canvas são reatribuídas a partir da imagem: o canvas
+  fica na resolução real do frame, e é o CSS que escala a exibição. Assim a
+  ROI continua em pixels de frame, correta depois de qualquer resize.
+*/
 function drawRoi() {
   const cv = $('#roi-canvas');
   if (!cv) return;
@@ -554,6 +900,14 @@ function drawRoi() {
 }
 
 // ============================================================= PAGE: DATASET ===
+/*
+  Contagem de arquivos do dataset (GET /api/dataset). Nada aqui executa
+  modelo: é inventário. O valor para o operador é enxergar o equilíbrio
+  entre as três divisões e entre as classes — é isso que decide se o
+  próximo treinamento vale a pena.
+  A árvore de pastas é texto montado com contagens reais, com "?." para as
+  divisões que ainda não existem: divisão sem pasta mostra 0, não erro.
+*/
 async function loadDataset() {
   try {
     const r = await api('/api/dataset');
@@ -594,6 +948,14 @@ $('#split-form')?.addEventListener('submit', async (ev) => {
 });
 
 $('#upload-btn')?.addEventListener('click', () => $('#upload-input').click());
+/*
+  Upload de várias imagens em sequência. Usa fetch cru (e não api()) porque
+  o envio é multipart: cabeçalho Content-Type tem que ser definido pelo
+  próprio navegador, com a fronteira. api() sempre forçaria JSON.
+  Enviar em loop (e não em paralelo) evita estourar memória e banda com
+  um lote grande de fotos de câmera. O erro individual é engolido de
+  propósito: uma imagem ruim não pode impedir as outras de subirem.
+*/
 $('#upload-input')?.addEventListener('change', async (ev) => {
   for (const f of ev.target.files) {
     const fd = new FormData(); fd.append('file', f);
@@ -611,6 +973,13 @@ $('#import-folder')?.addEventListener('click', async () => {
 });
 
 // ========================================================== PAGE: ANOTAÇÃO ===
+/*
+  Pendências de anotação (GET /api/annotation). O front não desenha caixas:
+  ele informa o que falta. Três situações e não duas — "sem objetos"
+  (tag-info) é diferente de "pendente" (tag-warn), porque uma imagem
+  negativa já está corretamente anotada: ela ensina ao modelo que aquela
+  parte da cena é vazia.
+*/
 async function loadAnnotation() {
   try {
     const r = await api('/api/annotation');
@@ -629,6 +998,14 @@ async function loadAnnotation() {
 $('#ann-open')?.addEventListener('click', () => $('#ann-help').classList.toggle('hidden'));
 
 // ======================================================= PAGE: TREINAMENTO ===
+/*
+  Estado do treino (GET /api/training/status). Três estados possíveis e
+  mutuamente exclusivos na pill: rodando (âmbar), finalizado (verde),
+  erro (vermelho). "Sem job nenhum" é um quarto caso e retorna cedo —
+  sem job não há barra nem métricas para pintar.
+  As métricas vêm do subprocesso de treino já parseadas pelo backend; aqui
+  só se formata. 4 casas decimais porque loss e mAP mudam na terceira.
+*/
 async function loadTraining() {
   try {
     const r = await api('/api/training/status');
@@ -681,6 +1058,17 @@ $('#train-refresh-log')?.addEventListener('click', async () => {
   $('#train-log').textContent = r.log || 'sem saída ainda.';
 });
 
+/*
+  Polling do progresso a cada 3s. O treinamento roda em processo separado, e
+  o backend não emite WebSocket para isso; 3s é o compromisso entre
+  responsividade da barra e peso no servidor durante um treino de horas.
+  clearInterval no início garante um timer só, mesmo entrando e saindo da
+  aba várias vezes.
+
+  O fim do treino é detectado comparando o texto da pill antes e depois do
+  load — truque barato, mas frágil: se alguém mudar esse texto, a detecção
+  de conclusão quebra junto.
+*/
 function startTrainingPoll() {
   clearInterval(S.pollTimer);
   S.pollTimer = setInterval(async () => {
@@ -697,6 +1085,18 @@ function startTrainingPoll() {
 }
 
 // ============================================================== PAGE: MODELO ===
+/*
+  Versões de modelo (GET /api/models). Três blocos:
+    1. modelo ativo, com métricas lidas do results.csv do treino
+    2. dispositivo: CUDA, VRAM, classes carregadas
+    3. tabela de versões, com o botão ATIVAR em cada linha
+
+  O texto de gpu-info tem uma consequência deliberada: se o modelo carregado
+  for genérico pré-treinado, ele avisa que as contagens não são confiáveis.
+  Um número bonito vindo de um modelo errado é pior que nenhum número.
+  Coluna "sem arquivo" (tag-warn) marca versão cadastrada cujo .pt sumiu do
+  disco — ativá-la falharia.
+*/
 async function loadModels() {
   try {
     const r = await api('/api/models');
@@ -734,6 +1134,12 @@ async function loadModels() {
   } catch (e) { toast(e.message, 'err'); }
 }
 
+/*
+  Ativar modelo: troca a quente. O aviso no modal existe porque o efeito é
+  imediato e silencioso — o próximo frame já sai com o modelo novo, sem
+  reiniciar a câmera e sem derrubar o WebSocket. Quem ativa precisa saber
+  disso antes de clicar, e precisa saber que o rollback existe.
+*/
 async function activateModel(id, file) {
   const ok = await confirmDialog('Ativar modelo',
     `O modelo ${file} passará a ser usado na detecção AGORA.\n\nO modelo atual será trocado em produção, sem reiniciar a câmera. É possível voltar ao anterior.`);
@@ -758,6 +1164,14 @@ $('#model-file')?.addEventListener('change', async (ev) => {
 });
 
 // ========================================================== PAGE: SETTINGS ===
+/*
+  Configuração efetiva (GET /api/config). Exibir a config ajuda a achar erro
+  de digitação no .env sem precisar de acesso ao servidor — a URL RTSP vem
+  mascarada, então mostrar isso é seguro.
+  Aqui innerHTML é usado para as linhas da tabela porque os campos são
+  identificadores e flags, não texto livre; o JSON cru vai por textContent
+  para preservar a formatação e nunca ser interpretado como marcação.
+*/
 async function loadSettings() {
   try {
     const cfg = await api('/api/config');
@@ -779,6 +1193,13 @@ async function loadSettings() {
 $('#cfg-refresh')?.addEventListener('click', loadSettings);
 
 // ================================================================ PAGE: LOGS ===
+/*
+  Duas fontes: arquivo de log (texto puro, mantido como está para não
+  distorcer alinhamento) e eventos do banco (tabela). Duas requisições
+  sequenciais: pouco dado, e o arquivo é o que o operador quer ver primeiro.
+  O nome do arquivo vem de um <select> com valores fixos, então o front
+  nunca manda um caminho arbitrário para o backend ler.
+*/
 async function loadLogs() {
   try {
     const f = $('#log-file').value;
@@ -801,6 +1222,13 @@ $('#events-clear')?.addEventListener('click', async () => {
   await api('/api/events', { method: 'DELETE' }); loadLogs(); toast('Eventos limpos.', 'ok');
 });
 
+/*
+  Eventos chegando pelo WebSocket (msg.type === "event").
+  Guarda dupla: só insere se a aba Logs estiver visível. Sem isso, o painel
+  pagaria uma reconstrução de tabela para cada evento mesmo com a aba
+  escondida. A linha entra no topo (prepend) porque o evento mais recente é
+  o que interessa.
+*/
 function addEventRow(e) {
   const tb = $('#events-table tbody');
   if (!tb || S.page !== 'logs') return;
@@ -812,6 +1240,18 @@ function addEventRow(e) {
 }
 
 // ================================================================ ROTEAMENTO ===
+/*
+  SPA à mão, com a hash como fonte da verdade. Duas tabelas:
+    TITLES  -> nome da aba no cabeçalho
+    LOADERS -> o que buscar quando a aba abre
+  Dashboard tem loader vazio de propósito: nada é buscado, tudo chega pelo
+  WebSocket. Treinamento tem loader composto porque precisa do load E do
+  polling.
+
+  TITLES também serve de lista branca: hash desconhecida cai no dashboard em
+  vez de mostrar uma seção vazia. Um erro de digitação na URL não pode
+  deixar a tela em branco.
+*/
 const TITLES = {
   dashboard: 'Dashboard', camera: 'Câmera', counting: 'Contagem', history: 'Histórico',
   calibration: 'Calibração', dataset: 'Dataset', annotation: 'Anotação',
@@ -824,6 +1264,16 @@ const LOADERS = {
   settings: loadSettings, logs: loadLogs,
 };
 
+/*
+  Troca de aba. Tudo que muda aqui é visibilidade e dados: as seções já
+  estavam no DOM, então o custo é pequeno. Note o que NÃO é redesenhado:
+  o vídeo continua tocando e a lista de pilhas do Dashboard continua
+  recebendo o WebSocket com a aba escondida. Interromper isso exigiria
+  pausar o stream, e é uma decisão de arquitetura, não de detalhe.
+
+  O try/catch no loader evita que uma falha de rede ao abrir uma aba
+  derrube o roteamento inteiro (e deixe a página em branco sem aviso).
+*/
 function route() {
   const page = (location.hash || '#dashboard').slice(1) || 'dashboard';
   S.page = TITLES[page] ? page : 'dashboard';
@@ -837,17 +1287,28 @@ function route() {
 window.addEventListener('hashchange', route);
 
 // ================================================================ INÍCIO ===
+// Relógio local. Independente do WS de propósito: mesmo com a câmera e o
+// backend fora, o operador precisa de uma referência de hora para saber se
+// o painel está congelado.
 function tickClock() {
   $('#clock').textContent = new Date().toLocaleString('pt-BR');
 }
 
+/*
+  Ordem de boot:
+    route() primeiro, para a aba da URL já aparecer antes de qualquer rede
+    connectWS() em seguida, para o estado começar a chegar o quanto antes
+    Chart.js por último, porque é a única dependência externa e pode
+      demorar ou nunca carregar sem quebrar o resto
+*/
 function boot() {
   route();
   connectWS();
   tickClock(); setInterval(tickClock, 1000);
   loadChartJs(initCharts);
 
-  // botão de menu no mobile
+  // botão de menu no mobile. Nasce por JavaScript em vez de estar no HTML
+  // para não existir em telas largas, onde ficaria invisível por CSS.
   const toggle = document.createElement('button');
   toggle.className = 'menu-toggle';
   toggle.textContent = '☰';
@@ -855,6 +1316,9 @@ function boot() {
   $('.topbar').appendChild(toggle);
 
   // badges de estado inicial
+  // Uma única chamada de status no boot, só para avisar sobre modelo
+  // genérico. É redundante em propósito: o WebSocket ainda não mandou nada
+  // e o operador precisa saber na hora se o número dele é confiável.
   api('/api/status').then(r => {
     if (r.model && !r.model.loaded) toast('Modelo específico ainda não treinado.', 'err');
   }).catch(() => {});

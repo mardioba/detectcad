@@ -215,6 +215,7 @@ def test_training_ignores_gitkeep_placeholders(client, monkeypatch: pytest.Monke
     import subprocess
 
     from app.config import settings
+    from app.services import training_service as training_service_mod
 
     train_dir = settings.dataset_dir / "images" / "train"
     train_dir.mkdir(parents=True, exist_ok=True)
@@ -224,11 +225,30 @@ def test_training_ignores_gitkeep_placeholders(client, monkeypatch: pytest.Monke
     def fail(*_a, **_k):  # pragma: no cover
         raise AssertionError("não deveria ter iniciado processo de treino")
 
-    monkeypatch.setattr(subprocess, "Popen", fail)
+    # Mira o `subprocess` do MÓDULO DO SERVIÇO, não o `subprocess` global.
+    #
+    # Com o monkeypatch global, qualquer biblioteca que internallyamente
+    # invoque um processo durante um import preguiçoso dispara o guard. Foi
+    # exatamente o que aconteceu: `cuda.pathfinder` chama
+    # `subprocess.Popen(['/sbin/ldconfig', '-p'])` (via ctypes.util.
+    # find_library) na primeira vez que o torch é carregado, e esse guard
+    # acusava um "treino iniciado" que nunca aconteceu. O teste falhava de
+    # forma intermitente, dependendo de o import já ter aquecido ou não -
+    # um teste que às vezes mente é pior do que nenhum.
+    monkeypatch.setattr(training_service_mod.subprocess, "Popen", fail)
+    runs_dir = settings.base_dir / "training" / "runs"
+    # Foto do antes: o teste precisa garantir que NENHUM treino novo nasceu, e
+    # não que a pasta esteja vazia. `training/runs` é o diretório REAL
+    # compartilhado: afirmar "não existe chair_counter*" quebra na segunda
+    # execução da suíte, porque o teste anterior pode ter deixado um
+    # diretório para trás. O sintoma é um teste que falha sozinho depois de
+    # passar uma vez.
+    before = set(runs_dir.glob("chair_counter*")) if runs_dir.is_dir() else set()
     r = client.post("/api/training/start", json={"epochs": 1})
     assert r.status_code in (400, 409)
     assert "imagem" in r.json()["message"].lower()
-    assert not list(settings.base_dir.joinpath("training", "runs").glob("chair_counter*"))
+    after = set(runs_dir.glob("chair_counter*")) if runs_dir.is_dir() else set()
+    assert after == before, f"treino indevido subiu: {after - before}"
 
 
 # ------------------------------------------------------------------- logs

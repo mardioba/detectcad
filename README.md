@@ -15,6 +15,9 @@ CÂMERA RTSP  →  CAPTURA  →  YOLO  →  PILHAS  →  CONTAGEM  →  ESTABILI
 
 ## Índice
 
+> **Primeira vez aqui?** Comece por [Antes de começar: o "?" não é defeito](#antes-de-começar-o--não-é-defeito),
+> depois vá direto para a [seção 8](#8-adicionar-as-primeiras-imagens).
+
 1. [O que o sistema faz](#1-o-que-o-sistema-faz)
 2. [Instalação](#2-instalação)
 3. [Configurar a câmera](#3-configurar-a-câmera)
@@ -37,6 +40,32 @@ CÂMERA RTSP  →  CAPTURA  →  YOLO  →  PILHAS  →  CONTAGEM  →  ESTABILI
 20. [Desenvolvimento e testes](#20-desenvolvimento-e-testes)
 21. [Estrutura do projeto](#21-estrutura-do-projeto)
 22. [Otimizações futuras](#22-otimizações-futuras)
+
+---
+
+## Antes de começar: o "?" não é defeito
+
+Nos primeiros minutos de uso é comum ver o dashboard assim:
+
+- o vídeo abre, a câmera fica `ONLINE`, mas o **total fica 0**;
+- as pilhas aparecem com **`?` em vez do número**;
+- o terminal avisa `Modelo específico ainda não treinado`.
+
+**Isso é o sistema funcionando.** Ele ainda não tem um modelo que conheça
+*sua* cadeira, então se recusa a dar um número em vez de inventar um. Um
+número grande e errado é pior que `?`: o `?` diz que você precisa treinar, o
+número não diz nada — e é esse número que o operador anota no papel.
+
+Enquanto isso, a **correção manual funciona** e o número do operador sempre
+entra no total:
+
+```bash
+curl -X POST http://localhost:8000/api/count/1/correct \
+     -H 'Content-Type: application/json' -d '{"count": 4}'
+```
+
+O caminho para sair desse estado está na **seção 8** (imagens) → **9**
+(anotar) → **10** (dividir) → **11** (treinar) → **13** (ativar).
 
 ---
 
@@ -378,7 +407,127 @@ STABILITY_MIN_CONFIDENCE=0.60  # abaixo disso: UNSTABLE
 O sistema precisa de fotos **reais** do seu depósito, da mesma câmera que
 será usada em produção. Sem imagens reais, não há como treinar.
 
-### Forma mais rápida: extrair de vídeo
+> **A armadilha número 1 deste projeto:** com a câmera parada, extrair 40
+> frames dá a impressão de ter 40 fotos de treino. Não dá. Medido neste
+> projeto: 43 frames da mesma cena diferem entre si por **2,7 em 255** — é
+> ruído de sensor. Para o modelo, são 1 exemplo repetido 43 vezes, e treinar
+> nisso produz um modelo que decora uma imagem.
+>
+> O que treina um detector não é **volume**, é **variedade de cena**. Um frame
+> de cada arranjo diferente vale mais que trinta frames do mesmo arranjo,
+> porque é a mudança de arranjo que ensina "onde está a cadeira", e não
+> "como é esta parede".
+>
+> Use a ferramenta da seção seguinte: ela compara as capturas e avisa quando
+> você só refez a mesma foto.
+
+### Forma recomendada: capturar por arranjo, com controle de variedade
+
+```bash
+# 1. posicione as cadeiras de um jeito
+# 2. capture dando um NOME ao arranjo
+python -m tools.collect_dataset --scene "pilha 3 - centro" --seconds 20
+
+# 3. reposicione, capture de novo com outro nome
+python -m tools.collect_dataset --scene "pilha 8 - esquerda" --seconds 20
+
+# a qualquer momento: onde eu estou?
+python -m tools.collect_dataset --status
+```
+
+A cada captura a ferramenta guarda uma assinatura da cena e compara com as
+anteriores. **Se você capturar sem rearranjar, ela avisa e descarta as
+imagens** — porque o sintoma de "esqueci de mover as cadeiras" e o de "a
+câmera está travada" é o mesmo, e sem aviso você só descobre depois de horas
+de anotação inútil.
+
+Já tem fotos prontas? Importe em vez de recapturar:
+
+```bash
+python -m tools.collect_dataset --from-dir fotos/ --scene "minhas fotos"
+```
+
+**Meta: 15 a 30 cenas distintas, 100 a 300 imagens.** Abaixo de 15 cenas o
+YOLO costuma não convergir. Acima de 30 o ganho é pequeno e o custo de
+anotar dobra.
+
+### E o que eu capturo agora?
+
+`collect_dataset` diz quanto você já tem; `plan_capture` diz **o que falta**,
+na ordem que mais rende:
+
+```bash
+python -m tools.plan_capture
+```
+
+Ele mede uma coisa que a contagem de imagens não revela — o
+**espalhamento da quantidade de cadeiras**:
+
+```
+  Quantidades de cadeiras já vistas:
+    [3, 4]
+    espalhamento: 1.3x  (de 3 a 4)
+    ⚠ pouco. O modelo nunca viu a quantidade mudar de verdade.
+      Alvo: pelo menos 4x, com os extremos (1 e ~20).
+```
+
+Quatro cenas e 44 imagens parecem progresso, mas se todas têm 3 ou 4
+cadeiras o dataset é quase um exemplo só repetido com pequenos desvios. É o
+erro que mais custa caro, porque parece trabalho feito.
+
+No fim ele imprime os comandos prontos, com a prioridade já ordenada:
+
+```
+  Capture a seguir, nesta ordem:
+    [0] cena VAZIA, sem nenhuma cadeira
+         python -m tools.collect_dataset --scene "vazio - sem cadeira" --seconds 20
+    [1] quantidade 1 cadeiras
+         python -m tools.collect_dataset --scene "pilha 1 - centro" --seconds 20
+    [1] quantidade 20 cadeiras
+         python -m tools.collect_dataset --scene "pilha 20 - centro" --seconds 20
+```
+
+As dimensões são lidas do **nome** que você deu em `--scene`. Nomeie de forma
+consistente (`pilha 8 - esquerda - noite`) e o plano fica preciso.
+
+> Ele **não** tenta adivinhar o arranjo pelos pixels. Isso foi testado e não
+> funciona aqui: o piso cerâmico de um galpão tem tanta borda quanto uma pilha
+> de cadeiras (29,1 contra 30,6 de energia de gradiente), porque ladrilho tem
+> linhas. Um detector por textura classificaria o chão como cadeira — e ele
+> recomenda o que não sabe medir.
+
+### O que a variedade precisa ser
+
+Não é quantidade, é **variedade de quantidade**. Grave trechos de:
+
+| Arranjo | Por que importa |
+|---|---|
+| 1, 2, 3, 5, 8, 12, 20 cadeiras | ensina a **variar a quantidade**, que é o que faz generalizar |
+| pilha à esquerda, centro e direita | o sistema agrupa pilhas por posição horizontal |
+| **cena vazia** (nenhuma cadeira) | sem isso o modelo nunca vê "não há nada aqui" |
+| dia e noite, com/sem luz acesa | variação de iluminação |
+| com e sem pessoa na frente | oclusão, que é onde a contagem mais falha |
+| ângulo mais alto e mais baixo | perspectiva muda a altura em pixels |
+
+### Quantas imagens?
+
+| Quantidade | Resultado esperado |
+|---|---|
+| < 30 | não funciona |
+| 100–300 | primeiros testes, ainda impreciso |
+| 500–1000 | uso real |
+| 2000+ | bom, com muita variação |
+
+**A variedade importa mais que a quantidade**: 1000 fotos do mesmo ângulo
+valem menos que 200 de 10 situações diferentes.
+
+Confira o resultado:
+
+```bash
+python -m app.main --image training/datasets/raw/alguma.jpg
+```
+
+### Forma alternativa: extrair de vídeo
 
 Fotografar centenas de vezes é inviável. Grave vídeo e extraia os frames:
 
@@ -400,33 +549,9 @@ nada — e avisa quando a variação foi insuficiente.
 
 Aba **Dataset** → **Enviar imagens**.
 
-### O que a variedade precisa ser
-
-Não é quantidade, é **variedade**. Grave trechos de:
-
-- pilhas com 3, 8, 15, 25 cadeiras (a variedade de quantidade é o que faz o
-  modelo generalizar)
-- dia e noite; com e sem pessoas na frente
-- ângulos diferentes; cadeiras encostadas em parede
-- a cadeira sozinha, para o modelo aprender a forma dela
-
-### Quantas imagens?
-
-| Quantidade | Resultado esperado |
-|---|---|
-| < 30 | não funciona |
-| 100–300 | primeiros testes, ainda impreciso |
-| 500–1000 | uso real |
-| 2000+ | bom, com muita variação |
-
-**A variedade importa mais que a quantidade**: 1000 fotos do mesmo ângulo
-valem menos que 200 de 10 situações diferentes.
-
-Confira o resultado:
-
-```bash
-python -m app.main --image training/datasets/raw/alguma.jpg
-```
+> Imagens enviadas pelo dashboard entram no disco **sem nome de cena**, então
+> não entram na contagem de variedade do `--status`. Para elas valerem no
+> relatório, importe com `python -m tools.collect_dataset --from-dir ...`.
 
 ---
 
@@ -481,9 +606,17 @@ python -m training.scripts.prepare_dataset --copy-only /minhas/fotos
 
 ### Anotar com o próprio modelo (economiza tempo)
 
-Depois que tiver um primeiro modelo razoável, a aba **Dataset` →
+Depois que tiver um primeiro modelo razoável, a aba **Dataset** →
 **Pré-rotular com IA** gera as caixas automaticamente. **Revise sempre**: o
 modelo erra, e um erro de anotação vira erro de treino.
+
+> **Só disponível depois de treinar o seu primeiro modelo.** Com o modelo
+> genérico pré-treinado a função se recusa a rodar, e é proposital: esse
+> modelo enxerga a **pilha inteira** como uma cadeira, então ela escreveria
+> "1 caixa = 1 cadeira" para uma pilha de 8. Não seria uma anotação ruim, e sim
+> uma anotação que contradiz a verdade — e como o revisor tende a confiar no
+> que a IA sugeriu, o erro passaria. Um dataset anotado assim ensina o modelo a
+> contar pilhas como cadeiras, e o erro aparece só meses depois, em produção.
 
 ### Qual classe usar?
 
@@ -553,7 +686,15 @@ fotos do mesmo ângulo valem menos que 200 de 10 situações diferentes.
 
 ### Passo 1 — Obter as imagens
 
-A forma mais rápida não é fotografar: é **gravar vídeo** e extrair os frames.
+A forma recomendada é capturar **um arranjo por vez**, com a ferramenta que
+avisa quando você repetiu a mesma cena (seção 8):
+
+```bash
+python -m tools.collect_dataset --scene "pilha 3 - centro" --seconds 20
+python -m tools.collect_dataset --status        # onde estou?
+```
+
+Alternativa genérica, se preferir gravar vídeo e extrair depois:
 
 ```bash
 # 1. Grave direto da câmera (nunca faça print do player)
@@ -571,13 +712,13 @@ python -m tools.extract_frames --rtsp-env CAMERA_RTSP_URL --seconds 300 --fps 1
 > player. Use frames limpos. (O script tenta remover a moldura, mas é
 > conservador de propósito: errar por não cortar é melhor que cortar cadeira.)
 
-O que gravar para o dataset variar:
+> **Vídeo longo com a câmera parada não gera dado.** Grave trechos de
+> situações diferentes, não 5 minutos do mesmo arranjo. A seção 8 explica a
+> medição por trás disso.
 
-- pilhas de 3, 8, 15, 25 cadeiras (a variedade de **quantidade** é o que faz
-  o modelo generalizar)
-- dia e noite, e com/sem pessoas na frente
-- ângulos diferentes, cadeiras encostadas em parede, empilhadas frouxas
-- a cadeira sozinha (para o modelo aprender a forma dela)
+O que gravar para o dataset variar está na tabela da seção 8. Em resumo:
+quantidades de 1 a 20, posições diferentes, cena vazia, luz diferente, com e
+sem gente na frente.
 
 ### Passo 2 — Anotar
 
@@ -1066,13 +1207,71 @@ python -c "from app.ai.yolo_detector import YoloDetector; d=YoloDetector(); prin
 
 ### A contagem está errada
 
+**Antes de tudo, veja se a pilha está mostrando `?` em vez do número.** Se
+está, o sistema está dizendo que ele não sabe — e está certo em dizer. O
+número bruto aparece na linha de detalhe ao lado, para diagnóstico.
+
+O `?` aparece nestas situações:
+
+| Situação | O que fazer |
+|---|---|
+| `model_trained: false` (modelo genérico) | treine o modelo — seção 11 |
+| status `BAIXA CONFIANÇA` | calcule a altura da cadeira e confira a ROI |
+| status `INDETERMINADO` | o padrão vertical é ambíguo; treine o modelo |
+| status `INSTÁVEL` | a contagem ainda está oscilando; aguarde |
+
+**Por que o sistema se recusa a mostrar o número.** Com o modelo genérico
+pré-treinado (COCO), o detector enxerga a **pilha inteira** como se fosse
+uma cadeira só. Aí os estimadores de textura passam a medir as ripas do
+encosto e as nervuras das pernas — que são uma repetição real e forte na
+imagem. Como todos eles erram **na mesma direção**, o "acordo entre
+estimadores" fica alto e a confiança passa do limite com um número errado.
+
+Isso significa que **ajustar `CONFIDENCE_THRESHOLD` não resolve**: o erro está
+no insumo (o modelo), não no cálculo. É por isso que o sistema usa o sinal
+mais grosso e mais confiável — o modelo é genérico? — em vez de confiar numa
+confiança que ele mesmo sabe que está contaminada.
+
+Diagnóstico, se o número está errado mesmo com modelo treinado:
+
 1. Abra **Calibração** → **Analisar ROI**.
-2. Se aparecer `PERÍODO AMBÍGUO`, o modelo genérico não é suficiente:
-   treine o modelo da empresa.
-3. Meça a altura da cadeira.
+2. Se aparecer `PERÍODO AMBÍGUO`, o passo encontrado não é o da cadeira.
+3. Meça a altura da cadeira (**Calibração** → medir). A contagem por período
+   depende disso: sem a altura em pixels, a busca do passo fica aberta e pode
+   travar numa repetição que não é cadeira.
 4. Erro de ±1 constante? Use o offset sugerido.
 5. Compare o método: teste `periodicity` vs `detections` e veja qual erra
    menos nas suas fotos.
+
+### O total fica em 0 mesmo com cadeiras na frente
+
+Esperado enquanto `model_trained` for `false`. O total oficial soma só o que
+o sistema considera medição. Para ele destravar:
+
+1. treine o modelo (seção 11) e ative-o (seção 13), **ou**
+2. **corrija na mão** — o número do operador sempre entra no total, porque o
+   olho humano é a única verdade disponível nesse regime:
+
+   ```bash
+   curl -X POST http://localhost:8000/api/count/1/correct \
+        -H 'Content-Type: application/json' -d '{"count": 4}'
+   ```
+
+   Isso grava o par (o que a IA viu, o que era verdade) em
+   `count_corrections`, que é o insumo do `suggest_offset` e do retreinamento.
+
+### Coletei 40 imagens e o modelo ficou ruim
+
+Quase sempre é isso: **você capturou a mesma cena 40 vezes.** Com a câmera
+parada, os frames diferem por ~2,7 em 255 (ruído de sensor) — para o modelo
+são 1 exemplo repetido.
+
+```bash
+python -m tools.collect_dataset --status
+```
+
+Se o número de **cenas distintas** estiver baixo, refaça a captura
+reposicionando as cadeiras a cada vez. Veja a seção 8.
 
 ### O dashboard está lento
 
@@ -1326,6 +1525,8 @@ detectcad/
 │   ├── scripts/{train,validate,test,export,prepare_dataset}.py
 │   └── runs/
 ├── tools/
+│   ├── collect_dataset.py       # captura por arranjo + controle de variedade
+│   ├── plan_capture.py          # o que capturar agora (espalhamento + cobertura)
 │   ├── extract_frames.py        # vídeo/RTSP → frames para o dataset
 │   ├── make_synthetic_stack.py  # pilhas sintéticas para teste
 │   ├── bench_counter.py         # benchmark sintético

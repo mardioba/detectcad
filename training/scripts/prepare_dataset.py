@@ -19,6 +19,25 @@ Sobre classes: o mapeamento é por NOME. As classes configuradas em
 ``training/configs/chairs.yaml`` são detectadas automaticamente.
 """
 
+# =============================================================================
+# ARQUIVO / MAPA  -  training/scripts/prepare_dataset.py
+#
+# O que faz: traduz anotações feitas em ferramentas externas (CVAT, Label
+#   Studio) para o formato YOLO, que é apenas um .txt por imagem. Nada de
+#   treinar aqui: este script só prepara o terreno.
+#
+# Ordem de leitura:
+#   1. detect_class_names .. escolhe a ordem das classes (a ordem define o id)
+#   2. convert_cvat ........ XML do CVAT -> caixas em coordenadas de pixel
+#   3. convert_labelstudio . JSON do Label Studio -> idem
+#   4. _write_labels ....... pixel -> normalizado 0..1 e grava o .txt
+#   5. copy_only ........... só copia imagens (quando ainda não há anotação)
+#   6. main() .............. CLI + relatório do que entrou e do que ficou de fora
+#
+# Saída: training/datasets/raw/ (configurável com --out), que é a entrada da
+#   divisão treino/val/test feita na aba Dataset do dashboard.
+# =============================================================================
+
 from __future__ import annotations
 
 import argparse
@@ -40,7 +59,13 @@ IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
 
 
 def detect_class_names(labels: set[str]) -> list[str]:
-    """Escolhe os nomes de classe, priorizando 'chair' e 'pile'."""
+    """Escolhe os nomes de classe, priorizando 'chair' e 'pile'.
+
+    A POSIÇÃO na lista é o id da classe dentro do .txt YOLO, então ela precisa
+    ser estável: mudar a ordem troca o significado das anotações antigas.
+    Por isso 'chair' e 'pile' vêm sempre primeiro, nessa ordem, e o resto vai
+    ordenado alfabeticamente.
+    """
     from app.services.dataset_service import DEFAULT_CLASSES
 
     preferred = [c for c in ("chair", "pile") if c in labels]
@@ -58,7 +83,8 @@ def convert_cvat(xml_path: Path, raw_dir: Path, names: list[str] | None) -> dict
     root = tree.getroot()
     raw_dir.mkdir(parents=True, exist_ok=True)
 
-    # mapa label_id -> nome
+    # mapa label_id -> nome. O CVAT pode declarar as labels em dois lugares
+    # (<meta><labels> e a lista de <label> solta), então os dois são lidos.
     label_map: dict[str, str] = {}
     for meta in root.findall(".//meta"):
         labels = meta.find("labels")
@@ -82,7 +108,7 @@ def convert_cvat(xml_path: Path, raw_dir: Path, names: list[str] | None) -> dict
         shutil.copy2(src, raw_dir / src.name)
         copied += 1
 
-    # caixas
+    # caixas: uma entrada por imagem, com as caixas em pixel (x1,y1,x2,y2,label)
     boxes_by_image: dict[str, list[list[float]]] = {}
     used_labels: set[str] = set()
     for box in root.findall(".//box"):
@@ -94,6 +120,8 @@ def convert_cvat(xml_path: Path, raw_dir: Path, names: list[str] | None) -> dict
         if not pts:
             continue
         try:
+            # "pts" do CVAT: "x1,y1;x2,y2;x3,y3;x4,y4" em pixel da imagem.
+            # Qualquer ponto que não seja "px,py" é descartado aqui.
             xs, ys = [], []
             for pair in pts.split(";"):
                 px, py = pair.split(",")
@@ -103,6 +131,7 @@ def convert_cvat(xml_path: Path, raw_dir: Path, names: list[str] | None) -> dict
             continue
         if not xs or not ys:
             continue
+        # Polígono vira retângulo envolvente: o YOLO de detecção só aceita caixa.
         boxes_by_image.setdefault(img, []).append(
             [min(xs), min(ys), max(xs), max(ys), label]
         )
@@ -123,6 +152,8 @@ def convert_labelstudio(json_path: Path, raw_dir: Path, names: list[str] | None)
     copied = 0
     for task in data:
         name = None
+        # Cada tarefa aponta para a imagem por chaves diferentes conforme a
+        # versão do Label Studio. Path(v).name tira o caminho completo.
         for k in ("file_upload", "image", "imagePath"):
             v = (task.get("data") or {}).get(k)
             if isinstance(v, str) and v:
@@ -131,6 +162,7 @@ def convert_labelstudio(json_path: Path, raw_dir: Path, names: list[str] | None)
         if not name:
             continue
         # copia a imagem se existir ao lado do json
+        # (o export do Label Studio costuma guardar em upload/ com prefixo).
         for base in (json_path.parent, json_path.parent / "upload"):
             cand = base / name
             if cand.is_file():
@@ -138,17 +170,25 @@ def convert_labelstudio(json_path: Path, raw_dir: Path, names: list[str] | None)
                 copied += 1
                 break
         else:
+            # O for-else só entra aqui se NENHUM caminho tinha a imagem; aí ela
+            # já está em raw/ (envio anterior) e seguimos só com os rótulos.
             cand = raw_dir / name
             if not cand.is_file():
                 continue
 
+        # Vários anotadores podem marcar a mesma imagem: por isso o for aninhado
+        # sobre todas as anotações e todos os resultados de cada uma.
         for ann in task.get("annotations") or []:
             for res in ann.get("result") or []:
                 if res.get("type") != "rectanglelabels" and "rectanglelabels" not in res.get("result", {}):
                     pass
+                # rectanglelabels é uma LISTA; este sistema tem uma classe por
+                # caixa, então só a primeira etiqueta é usada.
                 labels = res.get("value", {}).get("rectanglelabels") or []
                 label = labels[0] if labels else "chair"
                 used_labels.add(label)
+                # O Label Studio dá canto superior + largura/altura em % da
+                # imagem; aqui vira x1,y1,x2,y2 em pixel para unificar com o CVAT.
                 x = float(res["value"].get("x", 0))
                 y = float(res["value"].get("y", 0))
                 w = float(res["value"].get("width", 0))
@@ -169,7 +209,9 @@ def _write_labels(
     tool: str,
 ) -> dict[str, Any]:
     """Grava os .txt YOLO ao lado das imagens em raw/."""
+    # Se o usuário não passou --names, a ordem sai das próprias anotações.
     final_names = names or detect_class_names(used_labels)
+    # nome -> id: é este dicionário que amarra a caixa ao número da 1ª coluna.
     name_to_id = {n: i for i, n in enumerate(final_names)}
     labels_dir = raw_dir / "labels"
     labels_dir.mkdir(parents=True, exist_ok=True)
@@ -181,6 +223,8 @@ def _write_labels(
         path = raw_dir / image_name
         if not path.is_file():
             continue
+        # Sem as dimensões reais da imagem não dá para normalizar: pular é
+        # melhor do que gravar um .txt com coordenadas inválidas.
         img = _read_size(path)
         if not img:
             continue
@@ -188,14 +232,19 @@ def _write_labels(
         lines: list[str] = []
         for x1, y1, x2, y2, label in items:
             if label not in name_to_id:
+                # Rótulo fora da lista de classes: conta e reporta em vez de
+                # inventar um id (o treino quebraria silenciosamente depois).
                 unknown.add(label)
                 continue
+            # Conversão de pixel para o formato YOLO: centro em fração da imagem
+            # e TAMANHO também em fração (0..1), não em pixels.
             cx = ((x1 + x2) / 2) / w
             cy = ((y1 + y2) / 2) / h
             bw = abs(x2 - x1) / w
             bh = abs(y2 - y1) / h
             lines.append(f"{name_to_id[label]} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
             boxes += 1
+        # Nome do .txt = nome da imagem sem extensão (regra do YOLO).
         (labels_dir / (path.stem + ".txt")).write_text("\n".join(lines) + "\n", encoding="utf-8")
         written += 1
 
@@ -210,6 +259,9 @@ def _write_labels(
 
 
 def _read_size(path: Path) -> tuple[int, int] | None:
+    """Largura e altura da imagem; None se não der para abrir."""
+    # OpenCV primeiro (já é dependência do projeto), PIL como reserva.
+    # IMREAD_COLOR é fixado para não varies com o conteúdo do arquivo.
     try:
         import cv2
 
@@ -228,9 +280,12 @@ def _read_size(path: Path) -> tuple[int, int] | None:
 
 
 def copy_only(folder: Path, raw_dir: Path) -> dict[str, Any]:
+    """Só copia as imagens, sem rótulo (para anotar depois no dashboard)."""
     raw_dir.mkdir(parents=True, exist_ok=True)
     n = 0
     for f in sorted(folder.iterdir()):
+        # sorted() = ordem estável, o que faz a divisão com seed ser reproduzível
+        # mesmo quando o --copy-only for repetido.
         if f.is_file() and f.suffix.lower() in IMAGE_EXTS:
             shutil.copy2(f, raw_dir / f.name)
             n += 1
@@ -240,6 +295,8 @@ def copy_only(folder: Path, raw_dir: Path) -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Prepara o dataset YOLO")
+    # Mutuamente exclusivo e obrigatório: as três entradas produzem formatos
+    # diferentes, misturá-las não faria sentido.
     src = p.add_mutually_exclusive_group(required=True)
     src.add_argument("--from-cvat", help="XML exportado pelo CVAT")
     src.add_argument("--from-labelstudio", help="JSON exportado pelo Label Studio")
@@ -248,7 +305,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--names", default="", help="Classes separadas por vírgula (ex.: chair,pile)")
     args = p.parse_args(argv)
 
+    # Sem --out usa settings.source_images_dir = training/datasets/raw, que é
+    # de onde a divisão do DatasetService lê.
     raw_dir = Path(args.out) if args.out else settings.source_images_dir
+    # --names fixo na mão; vazio = deduzir das anotações (detect_class_names).
     names = [n.strip() for n in args.names.split(",") if n.strip()] or None
 
     if args.from_cvat:
@@ -266,6 +326,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  Arquivos .txt:  {result['label_files']}")
     print(f"  Caixas:         {result['boxes']}")
     print(f"  Classes:        {', '.join(result['classes']) or '(nenhuma)'}")
+    # Rótulo ignorado é o aviso mais importante do relatório: significa que
+    # alguém anotou um nome de classe que o modelo não vai ter.
     if result["unknown_labels"]:
         print(f"  Rótulos ignorados (não estão nas classes): {', '.join(result['unknown_labels'])}")
     print(f"  Destino:        {raw_dir}")
@@ -273,6 +335,9 @@ def main(argv: list[str] | None = None) -> int:
     print()
     print("PRÓXIMOS PASSOS:")
     print("  1. Confira o YAML de classes: training/configs/chairs.yaml")
+    # A divisão é feita aqui, e não neste script, porque ela usa a MESMA seed
+    # do treino (settings.training.seed): sem isso, comparar dois modelos
+    # seria comparar também conjuntos de validação diferentes.
     print("  2. Abra o dashboard → aba Dataset → Dividir dataset (com seed)")
     print("  3. Treine: aba Treinamento → INICIAR TREINAMENTO")
     return 0

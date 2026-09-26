@@ -33,23 +33,45 @@ usage() {
     exit 0
 }
 
-# ------------------------------ argumentos ----------------------------------
-for arg in "$@"; do
-    case "$arg" in
-        --no-install) DO_INSTALL=0 ;;
-        --help|-h) usage ;;
-        --image|--video|--host|--port|--fps|--model|--device) RUN_ARGS+=("$arg") ;;
-        --image=*|--video=*|--host=*|--port=*|--fps=*|--model=*|--device=*) RUN_ARGS+=("$arg") ;;
-        --train|--test) RUN_ARGS+=("$arg") ;;
-        *) RUN_ARGS+=("$arg") ;;
-    esac
-done
-
 # ------------------------------- funções -----------------------------------
 log()  { printf "${CYAN}==>${RESET} %s\n" "$*"; }
 ok()   { printf "${GREEN}  ✓${RESET} %s\n" "$*"; }
 warn() { printf "${YELLOW}  !${RESET} %s\n" "$*"; }
 err()  { printf "${RED}  ✗${RESET} %s\n" "$*"; }
+
+# ------------------------------ argumentos ----------------------------------
+# Linha de comando original, preservada para o --train (que repassa tudo).
+ORIG_ARGS=("$@")
+
+# Usa shift em vez de `for arg in "$@"`: só assim uma opção com valor consegue
+# consumir o argumento seguinte. Com o `for`, "./run.sh --image f.jpg" virava
+# dois argumentos soltos e o argparse reclamava de "f.jpg".
+while [ $# -gt 0 ]; do
+    arg="$1"
+    shift
+    case "$arg" in
+        --no-install)
+            DO_INSTALL=0
+            ;;
+        --help|-h)
+            usage
+            ;;
+        --image=*|--video=*|--host=*|--port=*|--fps=*|--model=*|--device=*)
+            RUN_ARGS+=("$arg")
+            ;;
+        --image|--video|--host|--port|--fps|--model|--device)
+            if [ $# -lt 1 ]; then
+                err "a opção $arg precisa de um valor (ex.: $arg arquivo.jpg)"
+                exit 1
+            fi
+            RUN_ARGS+=("$arg" "$1")
+            shift
+            ;;
+        *)
+            RUN_ARGS+=("$arg")
+            ;;
+    esac
+done
 
 banner() {
     cat <<'EOF'
@@ -168,7 +190,7 @@ if [ "${RUN_ARGS[0]:-}" = "--test" ]; then
 fi
 if [ "${RUN_ARGS[0]:-}" = "--train" ]; then
     banner; echo "Validando modelo..."; echo
-    python -m training.scripts.validate "$@"
+    python -m training.scripts.validate "${ORIG_ARGS[@]}"
     exit $?
 fi
 
@@ -215,4 +237,11 @@ Dashboard:  http://${SHOW_HOST}:${PORT}
 
 EOF
 
-exec python -m app.main "${RUN_ARGS[@]:-}"
+# Só expande o array quando ele tem itens: "${RUN_ARGS[@]:-}" com o array
+# vazio gera uma string vazia, que o argparse rejeita como argumento
+# desconhecido ("error: unrecognized arguments:").
+if [ ${#RUN_ARGS[@]} -gt 0 ]; then
+    exec python -m app.main "${RUN_ARGS[@]}"
+else
+    exec python -m app.main
+fi
